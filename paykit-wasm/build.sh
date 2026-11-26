@@ -6,8 +6,9 @@
 #
 # The profile defaults to browser-release (size-optimized, see the workspace Cargo.toml). The
 # script builds the paykit-wasm cdylib for wasm32-unknown-unknown with --locked, then runs
-# `wasm-bindgen --target web --out-name paykit_wasm` on it into the output folder, which it
-# empties first. The default folder is <target dir>/paykit-wasm-pkg/<profile>. Needs
+# `wasm-bindgen --target web --out-name paykit_wasm` on it into the output folder. It replaces
+# only the module's own files there and leaves anything else in the folder alone. The default
+# folder is <target dir>/paykit-wasm-pkg/<profile>. Needs
 # wasm-bindgen on PATH (or in WASM_BINDGEN) at exactly the wasm-bindgen version of Cargo.lock,
 # and jq. The last line it prints is the output folder.
 #
@@ -67,8 +68,13 @@ wasm=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "paykit_
   | .filenames[] | select(endswith(".wasm"))' <<<"$messages" | tail -n 1)
 [[ -n "$wasm" && -f "$wasm" ]] || die "cargo reported no paykit_wasm .wasm file"
 
-rm -rf "$out"
+# Remove only what wasm-bindgen writes, never the folder: --out-dir may name a folder that holds
+# other files.
+outputs=(paykit_wasm.js paykit_wasm_bg.wasm paykit_wasm.d.ts paykit_wasm_bg.wasm.d.ts)
 mkdir -p "$out"
+for file in "${outputs[@]}"; do
+  rm -f "$out/$file"
+done
 "$bindgen" --target web --out-name paykit_wasm --out-dir "$out" "$wasm" ||
   die "wasm-bindgen failed"
 
