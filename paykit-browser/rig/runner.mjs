@@ -19,6 +19,10 @@
 //   PAYKIT_BROWSER_RIG_ORIGIN    set by `test.sh --dispatch` for the network tests, whose rig
 //                                (dispatch-rig.mjs) serves a self-signed certificate. When it is
 //                                set, the page and its worker ignore certificate errors.
+//   PAYKIT_BROWSER_PAGE_HOST     localhost opens the test page on http://localhost:<port>
+//                                instead of http://127.0.0.1:<port>, where
+//                                wasm-bindgen-test-runner serves it; `test.sh --local-dispatch`
+//                                sets it. Unset or 127.0.0.1 keeps the address.
 //   PAYKIT_BROWSER_SKIP_KEYCHAIN_TESTS  1 leaves the tests named in KEYCHAIN_TESTS below out of
 //                                WebKit runs, for local runs on macOS only, and is refused on
 //                                any other platform; 0 or unset runs every test. Playwright's
@@ -162,6 +166,11 @@ if (!(timeoutSecs > 0 && timeoutSecs <= MAX_TIMEOUT_SECS)) {
   process.exit(2);
 }
 const runnerBin = process.env.WASM_BINDGEN_TEST_RUNNER || "wasm-bindgen-test-runner";
+const pageHost = process.env.PAYKIT_BROWSER_PAGE_HOST || "127.0.0.1";
+if (pageHost !== "127.0.0.1" && pageHost !== "localhost") {
+  log(`[runner] PAYKIT_BROWSER_PAGE_HOST must be 127.0.0.1 or localhost, not "${pageHost}"`);
+  process.exit(2);
+}
 const started = Date.now();
 
 let child;
@@ -281,7 +290,10 @@ function serveTests(args) {
         const url = output.match(SERVING_LINE);
         if (url) {
           served = true;
-          resolve(url[1]);
+          // The runner listens on 127.0.0.1, which a browser reaches as localhost too.
+          const page = new URL(url[1]);
+          if (page.hostname === "127.0.0.1") page.hostname = pageHost;
+          resolve(page.href);
         }
       });
     };
