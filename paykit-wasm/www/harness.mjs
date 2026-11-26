@@ -2,7 +2,9 @@
 // page, the worker and the engine module; a persistent browser profile, so the Origin Private
 // File System is on disk; engines in dedicated workers, with Homeserver callbacks on fetch
 // against a Homeserver with the fake Homeserver's API; every engine event streamed to Node;
-// and native peers (`paykit-peer`) driven over their stdin and stdout.
+// native peers (`paykit-peer`) driven over their stdin and stdout; and test payment methods
+// (`RegtestRail`) that pay and verify on bitcoind regtest from Node, which the workers reach
+// over the page server.
 //
 // Waits are on events, never on sleeps: `engine.waitFor(match)` and `peer.waitFor(match)`
 // resolve with the first event, seen or still to come, that `match` accepts, and fail after a
@@ -181,13 +183,14 @@ class Engine {
     this.log = new EventLog(`engine ${name}`);
   }
 
-  /** Calls the engine's export `op`: `{ok: true, value}` or `{ok: false, error}`. */
+  /** Calls the engine's export `op`: `{ok: true, value}` or `{ok: false, error, code,
+   * reason}`, `code` and `reason` the engine error's properties. */
   call(op, ...args) {
     return this.harness.page.evaluate(
       ([name, op, args]) =>
         window.callWorker(name, op, args).then(
           (value) => ({ ok: true, value }),
-          (error) => ({ ok: false, error: error.message }),
+          (error) => ({ ok: false, error: error.message, code: error.code ?? null, reason: error.reason ?? null }),
         ),
       [this.name, op, args],
     );
@@ -271,6 +274,123 @@ class Peer {
   }
 }
 
+/** An amount in whole BTC as a decimal string, in sats, without floating point. */
+export function btcToSats(value) {
+  const match = /^(\d+)(?:\.(\d{1,8}))?$/.exec(value);
+  if (!match) throw new Error(`not a BTC amount with at most 8 fraction digits: ${value}`);
+  return BigInt(match[1]) * 100_000_000n + BigInt((match[2] ?? "").padEnd(8, "0"));
+}
+
+/** Sats as a decimal string in whole BTC, 8 fraction digits. */
+export function satsToBtc(sats) {
+  const value = BigInt(sats);
+  return `${value / 100_000_000n}.${(value % 100_000_000n).toString().padStart(8, "0")}`;
+}
+
+/** The sats a transaction pays to `address`, over all its outputs: `{sats, tx}`. bitcoind has a
+ * transaction index on regtest, so any transaction is found, in the mempool or in a block. */
+export async function paidTo(txid, address) {
+  const tx = await bitcoindCall("getrawtransaction", [txid, true]);
+  let sats = 0n;
+  for (const output of tx.vout) {
+    if (output.scriptPubKey?.address === address) sats += btcToSats(output.value.toFixed(8));
+  }
+  return { sats, tx };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A test payment method on bitcoind regtest: a bitcoind wallet of its own pays with
+ * `sendtoaddress` and verifies with the transaction index, under the demo's regtest contract
+ * (payload `{"value":"<address>"}`, proof `{"txid"}`, amount in BTC). The worker's rail
+ * callbacks reach it over the page server at `/rail/<name>/<op>` (`url`).
+ *
+ * `behaviour` shapes a payment, to play a slow method such as a payment out of a shared pool:
+ * `delayMs` before the transaction is sent, `holdMs` after it is sent before `pay` answers.
+ * Every call is kept in `calls`; each attempt's record in `attempts`.
+ */
+export class RegtestRail {
+  constructor(name, wallet) {
+    this.name = name;
+    this.wallet = wallet;
+    this.url = `/rail/${name}`;
+    this.behaviour = { delayMs: 0, holdMs: 0 };
+    /** attemptId -> {state: "paying" | "paid" | "failed", txid, address, sats, paidAtMs} */
+    this.attempts = new Map();
+    /** [{op, attemptId, atMs}] */
+    this.calls = [];
+  }
+
+  /** A new address of the rail's wallet: `bech32m` (P2TR) or `bech32` (P2WPKH). */
+  async newAddress(type = "bech32m") {
+    return bitcoindCall("getnewaddress", ["", type], this.wallet);
+  }
+
+  async pay({ attemptId, endpointId, payload, amount }) {
+    this.calls.push({ op: "pay", attemptId, atMs: Date.now() });
+    const known = this.attempts.get(attemptId);
+    if (known) return this.outcome(known);
+    const record = { state: "paying", endpointId };
+    this.attempts.set(attemptId, record);
+    const { delayMs, holdMs } = this.behaviour;
+    if (delayMs) await sleep(delayMs);
+    try {
+      if (amount.asset !== "btc") throw new Error(`asset ${amount.asset}`);
+      record.address = JSON.parse(payload).value;
+      record.sats = btcToSats(amount.value);
+      record.txid = await bitcoindCall(
+        "sendtoaddress",
+        { address: record.address, amount: satsToBtc(record.sats), fee_rate: 2 },
+        this.wallet,
+      );
+      record.paidAtMs = Date.now();
+      record.state = "paid";
+      log(`rail ${this.name}: paid ${record.sats} sats to ${record.address.slice(0, 14)}... in ${record.txid}`);
+    } catch (error) {
+      // Nothing was sent: bitcoind refused before broadcasting.
+      record.state = "failed";
+      log(`rail ${this.name}: pay failed, nothing sent: ${error.message}`);
+    }
+    if (holdMs) await sleep(holdMs);
+    return this.outcome(record);
+  }
+
+  payment(attemptId) {
+    this.calls.push({ op: "payment", attemptId, atMs: Date.now() });
+    const record = this.attempts.get(attemptId);
+    return record ? this.outcome(record) : null;
+  }
+
+  async verify({ payload, amount, proof }) {
+    this.calls.push({ op: "verify", attemptId: null, atMs: Date.now() });
+    const address = JSON.parse(payload ?? "{}").value;
+    if (!address || amount.asset !== "btc" || !/^[0-9a-f]{64}$/.test(proof?.txid ?? "")) return null;
+    let found;
+    try {
+      found = await paidTo(proof.txid, address);
+    } catch {
+      return null;
+    }
+    if (found.sats < btcToSats(amount.value)) return null;
+    // First seen: the wallet's receive time when the address is the rail's own, else now.
+    const own = await bitcoindCall("gettransaction", [proof.txid, true], this.wallet).catch(() => null);
+    return own?.timereceived ? own.timereceived * 1000 : Date.now();
+  }
+
+  outcome(record) {
+    if (record.state === "paid") {
+      return { status: "paid", proof: { txid: record.txid }, paidAtMs: record.paidAtMs };
+    }
+    return { status: record.state === "failed" ? "failed" : "pending" };
+  }
+
+  /** The `pay` calls made for `attemptId`. */
+  payCalls(attemptId) {
+    return this.calls.filter((call) => call.op === "pay" && call.attemptId === attemptId);
+  }
+}
+
 /** The harness: the server, the browser, the page, its engines and the peers. */
 class Harness {
   constructor({ server, context, page, profile }) {
@@ -280,6 +400,7 @@ class Harness {
     this.profile = profile;
     this.engines = new Map();
     this.peers = [];
+    this.rails = server.rails;
   }
 
   /** The page's URL. */
@@ -308,6 +429,24 @@ class Harness {
       ownIdentity: zbase32(publicKeyOf(secret)),
       ...overrides,
     };
+  }
+
+  /** A new test payment method `name` (`RegtestRail`), with a bitcoind wallet of its own
+   * funded with `fundSats` from the `default` wallet and one block mined. Pass its `url` as
+   * the `railUrl` start option. */
+  async openRail(name, { fundSats = 200_000 } = {}) {
+    const wallet = `paykit-wasm-${name}-${randomBytes(4).toString("hex")}`;
+    await bitcoindCall("createwallet", [wallet]);
+    const rail = new RegtestRail(name, wallet);
+    this.rails.set(name, rail);
+    if (fundSats > 0) {
+      const address = await rail.newAddress("bech32");
+      await bitcoindCall("sendtoaddress", { address, amount: satsToBtc(fundSats), fee_rate: 2 }, "default");
+      const miner = await bitcoindCall("getnewaddress", [], "default");
+      await bitcoindCall("generatetoaddress", [1, miner]);
+    }
+    log(`rail ${name}: wallet ${wallet}, funded ${fundSats} sats`);
+    return rail;
   }
 
   /** Starts a native peer on a new state folder under `settings.runRoot`, and waits for
@@ -350,16 +489,21 @@ class Harness {
       await peer.quit().catch(() => {});
       if (peer.wallet) await bitcoindCall("unloadwallet", [peer.wallet]).catch(() => {});
     }
+    for (const rail of this.rails.values()) {
+      await bitcoindCall("unloadwallet", [rail.wallet]).catch(() => {});
+    }
     await this.context.close().catch(() => {});
     this.server.close();
     rmSync(this.profile, { recursive: true, force: true });
   }
 }
 
-/** One bitcoind JSON-RPC call. */
-export async function bitcoindCall(method, params) {
+/** One bitcoind JSON-RPC call; `params` an array or an object of named parameters. With
+ * `wallet`, the call goes to that wallet. */
+export async function bitcoindCall(method, params, wallet) {
   const auth = Buffer.from(`${settings.rpcUser}:${settings.rpcPassword}`).toString("base64");
-  const answer = await fetch(settings.bitcoind, {
+  const url = wallet ? `${settings.bitcoind}/wallet/${encodeURIComponent(wallet)}` : settings.bitcoind;
+  const answer = await fetch(url, {
     method: "POST",
     headers: { authorization: `Basic ${auth}`, "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "1.0", id: "harness", method, params }),
@@ -369,12 +513,35 @@ export async function bitcoindCall(method, params) {
   return body.result;
 }
 
-/** Serves the page, the worker and the engine module in `pkg` on 127.0.0.1. */
+/** Answers a worker's rail call `POST /rail/<name>/<op>` with the rail's JSON answer. */
+async function railCall(rails, path, req, res) {
+  const [, , name, op] = path.split("/");
+  const rail = rails.get(name);
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  try {
+    if (!rail || !["pay", "payment", "verify"].includes(op)) throw new Error(`no rail call ${path}`);
+    const value = await rail[op](JSON.parse(body));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(value ?? null));
+  } catch (error) {
+    res.writeHead(500, { "content-type": "text/plain" });
+    res.end(error.message);
+  }
+}
+
+/** Serves the page, the worker and the engine module in `pkg` on 127.0.0.1, and the rail
+ * calls of `server.rails`. */
 function serve(pkg) {
   const files = { "/": join(here, "index.html"), "/worker.js": join(here, "worker.js") };
   const types = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm" };
+  const rails = new Map();
   const server = http.createServer((req, res) => {
     const path = new URL(req.url, "http://localhost").pathname;
+    if (req.method === "POST" && path.startsWith("/rail/")) {
+      railCall(rails, path, req, res);
+      return;
+    }
     let file = files[path];
     if (!file && path.startsWith("/pkg/")) {
       const candidate = normalize(join(pkg, path.slice("/pkg/".length)));
@@ -389,6 +556,7 @@ function serve(pkg) {
       res.end();
     }
   });
+  server.rails = rails;
   return new Promise((done) => server.listen(0, "127.0.0.1", () => done(server)));
 }
 
