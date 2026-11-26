@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>paykit-wasm smoke</title>
+    <script type="module">
+      // Each worker runs one engine. `smoke.mjs` drives them through these two functions.
+      const workers = new Map();
+      let next = 0;
+
+      window.openWorker = (name) => {
+        const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+        const pending = new Map();
+        worker.onmessage = (event) => {
+          const { id, ok, value, error } = event.data;
+          const call = pending.get(id);
+          pending.delete(id);
+          if (ok) call.resolve(value);
+          else call.reject(new Error(error));
+        };
+        worker.onerror = (event) => {
+          for (const call of pending.values()) call.reject(new Error(`worker error: ${event.message}`));
+          pending.clear();
+        };
+        workers.set(name, { worker, pending });
+      };
+
+      window.callWorker = (name, op, args) =>
+        new Promise((resolve, reject) => {
+          const entry = workers.get(name);
+          if (!entry) return reject(new Error(`no worker ${name}`));
+          const id = next++;
+          entry.pending.set(id, { resolve, reject });
+          entry.worker.postMessage({ id, op, args });
+        });
+
+      window.closeWorker = (name) => {
+        workers.get(name)?.worker.terminate();
+        workers.delete(name);
+      };
+    </script>
+  </head>
+  <body>
+    paykit-wasm smoke
+  </body>
+</html>
