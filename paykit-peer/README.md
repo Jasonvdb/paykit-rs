@@ -115,6 +115,7 @@ again.
 | `allowed` | `id` | after `allow` |
 | `request_sent` | `to`, `msg_id`, `request_hash`, `sats`, `reference`, `destination` (`endpoints`/`any`), `endpoint_id`, `address` (`null` for `any`), `delivery` | after `request` |
 | `list_published` | `to`, `endpoint_id`, `address` | after `publish-list` |
+| `list_received` | `from`, `app_id` (hex), `generation`, `counter`, `expires_at_ms`, `endpoints` (each `endpoint_id`, `address`, `single_use`) | a counterparty's Private Payment List arrived and is held, once per list version |
 | `request_received` | `from` (the payee), `request_hash`, `sats`, `amount`, `asset`, `reference`, `status`, `recurring`, `manual_only` | payer: a request is held |
 | `request_status` | `request_hash`, `status` (`Open`, `Paid`, ...) | payer: each status a request reaches |
 | `paid` | `payee`, `request_hash`, `attempt_id`, `proof_msg_id`, `txid`, `address`, `endpoint_id`, `sats` | payer: the rail paid and the proof was sent |

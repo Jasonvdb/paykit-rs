@@ -578,6 +578,29 @@ impl Paykit {
             .collect())
     }
 
+    /// The Private Payment Lists this app holds from `payee`, one per publishing App ID, as
+    /// placed in their `payment_lists` records (Paykit spec 8.4, wire 5.4). A list still held
+    /// over its record ([`Paykit::held_lists`]) is not included. For local test tools that
+    /// show what a counterparty shared; paying goes through [`Paykit::pay_request`].
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn received_lists(
+        &self,
+        payee: &[u8; 32],
+    ) -> Result<Vec<([u8; 16], paykit_lib::bodies::PrivatePaymentList)>> {
+        Ok(self
+            .lists_of(payee)
+            .await?
+            .into_iter()
+            .filter_map(|record| match record.list.body() {
+                paykit_lib::Body::PrivatePaymentList(list) => Some((record.app_id, list.clone())),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// The `lgone/` entry of the `payment_lists` record at `record_key`, if this app saw it
     /// deleted or read a value there naming a delete ([`crate::state::LostListRecord`]).
     pub(crate) async fn list_record_lost(
