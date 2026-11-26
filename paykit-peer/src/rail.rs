@@ -3,7 +3,7 @@
 //!
 //! | Item | Value |
 //! |---|---|
-//! | Receive identifier | `btc-regtest-p2wpkh` (`getnewaddress "" bech32`) |
+//! | Receive identifier | `btc-regtest-p2wpkh` (`getnewaddress "" bech32`); `btc-regtest-p2tr` (`bech32m`) when a request asks for Taproot |
 //! | Identifiers it pays | `btc-regtest-p2wpkh`, `btc-regtest-p2tr` |
 //! | Payload | `{"value":"<address>"}` |
 //! | Amount | asset `btc`, decimal BTC, 8 fraction digits |
