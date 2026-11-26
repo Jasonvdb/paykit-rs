@@ -31,6 +31,15 @@ pubky-dispatch-harness = { git = "https://github.com/pubky/pubky-dispatch", rev 
 [patch.crates-io]
 rustls-platform-verifier-android = { path = "vendor/rustls-platform-verifier-android" }
 
+# Take the Pubky Dispatch crates from a fork whose signer builds for wasm32-unknown-unknown and
+# whose service runs on a local origin. All four come from one commit, so Cargo builds a single
+# copy of pubky-dispatch-core and pubky-dispatch-client and their types match across the crates.
+[patch."https://github.com/pubky/pubky-dispatch"]
+pubky-dispatch-core = { git = "https://github.com/Jasonvdb/pubky-dispatch", rev = "0ea0904f30589ecbf3fece953fc2be0e96ecfd5b" }
+pubky-dispatch-client = { git = "https://github.com/Jasonvdb/pubky-dispatch", rev = "0ea0904f30589ecbf3fece953fc2be0e96ecfd5b" }
+pubky-dispatch-signer = { git = "https://github.com/Jasonvdb/pubky-dispatch", rev = "0ea0904f30589ecbf3fece953fc2be0e96ecfd5b" }
+pubky-dispatch-harness = { git = "https://github.com/Jasonvdb/pubky-dispatch", rev = "0ea0904f30589ecbf3fece953fc2be0e96ecfd5b" }
+
 [profile.dev.package."*"]
 opt-level = 2
 
