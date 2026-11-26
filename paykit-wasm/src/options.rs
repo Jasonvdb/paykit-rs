@@ -29,6 +29,10 @@ const DEFAULT_CLIENT_ID: &str = "paykit-wasm";
 /// The most fraction digits an amount carries (Paykit wire 1.2).
 const MAX_FRACTION_DIGITS: u32 = 18;
 
+/// The shortest and the longest pay limit a host may set, in milliseconds: a second, and the
+/// method's declared longest completion, an hour.
+const PAY_LIMIT_RANGE_MS: std::ops::RangeInclusive<u64> = 1_000..=3_600_000;
+
 /// The options of `start`.
 pub struct StartOptions {
     /// The identity's 32-byte secret key, wiped on drop.
@@ -48,6 +52,8 @@ pub struct StartOptions {
     pub homeserver: HomeserverCallbacks,
     /// The host's payment method callbacks.
     pub rail: RailCallbacks,
+    /// How long the SDK waits for one `pay` call before the attempt is left open, in ms.
+    pub pay_limit_ms: u64,
     /// The host's `onEvent(event)` callback, if any (`events.rs`).
     pub on_event: Option<Function>,
     /// Whether the engine runs its own feed loop from `start` until `stop`: `true` unless
@@ -105,6 +111,8 @@ struct PlainOptions {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlainRail {
     endpoints: Vec<PlainEndpoint>,
+    #[serde(default)]
+    pay_limit_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +167,15 @@ impl StartOptions {
             return Err(EngineError::bad_options("clientId is empty"));
         }
         let endpoints = endpoints(&plain.rail.endpoints)?;
+        let pay_limit_ms = plain
+            .rail
+            .pay_limit_ms
+            .unwrap_or(crate::rail::DEFAULT_PAY_LIMIT_MS);
+        if !PAY_LIMIT_RANGE_MS.contains(&pay_limit_ms) {
+            return Err(EngineError::bad_options(
+                "rail.payLimitMs is not between 1,000 and 3,600,000",
+            ));
+        }
 
         let homeserver_object = property(value, "homeserver")?;
         let homeserver = HomeserverCallbacks {
@@ -183,6 +200,7 @@ impl StartOptions {
             endpoints,
             homeserver,
             rail,
+            pay_limit_ms,
             on_event,
             auto_receive: plain.auto_receive.unwrap_or(true),
         })

@@ -15,9 +15,17 @@
 //! told to the host as an `error` event and tried again after the pace's pause. Once a minute
 //! it runs the signer's due work, which renews the app's certificate and answers its key
 //! bundle requests.
+//!
+//! **Payments left open** are resumed by the loop (`Paykit::resume_payments`): once after
+//! `start`, so a payment a restart interrupted is finished, its proof sent; at once when a
+//! host `pay` call answers after the SDK stopped waiting for it (`flights.rs`); and at each
+//! turn of the loop while an outcome says the payment still waits on its method.
 
 use std::collections::HashMap;
+use std::future::{poll_fn, Future};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use js_sys::Date;
@@ -81,7 +89,7 @@ pub async fn round(engine: &Rc<Engine>) -> Result<Value, RoundError> {
     for _ in 0..READS_PER_ROUND {
         let read = Box::pin(turn.paykit.receive(None))
             .await
-            .map_err(|error| RoundError::Failed(EngineError::paykit("receive", &error)))?;
+            .map_err(|error| RoundError::Failed(EngineError::sdk("receive", &error)))?;
         for event in &read.report.events {
             if let Some(id) = event.id() {
                 last_event = Some(id);
@@ -136,7 +144,9 @@ pub async fn round(engine: &Rc<Engine>) -> Result<Value, RoundError> {
             run_signer(engine, &mut turn).await.map(|_| ()),
         );
     }
-    observe(engine, &turn).await;
+    // A read does not send: what waits in the outbox, such as a proof or a receipt whose
+    // first try failed, is tried again now.
+    deliver(engine, &mut turn).await;
     drop(turn);
     if let Value::Object(fields) = &mut summary {
         fields.insert("applied".into(), json!(applied));
@@ -181,7 +191,7 @@ fn report(engine: &Engine, step: &'static str, result: Result<(), EngineError>) 
 pub async fn requests(turn: &Turn) -> Result<Vec<RequestView>, EngineError> {
     Ok(Box::pin(turn.paykit.requests())
         .await
-        .map_err(|error| EngineError::paykit("read the requests", &error))?
+        .map_err(|error| EngineError::sdk("read the requests", &error))?
         .into_iter()
         .filter(|view| !view.recurring)
         .collect())
@@ -228,9 +238,51 @@ pub async fn baseline(engine: &Rc<Engine>) {
     }
 }
 
+/// Tries the outbox now (`Paykit::flush`), then tells the host what changed: the end of every
+/// round, and of every call that queues a message. A failed try is told as an `error` event
+/// with `during: "flush"`; the messages stay queued for the next round.
+pub async fn deliver(engine: &Engine, turn: &mut Turn) {
+    let flushed = Box::pin(turn.paykit.flush())
+        .await
+        .map_err(|error| EngineError::sdk("send the queued messages", &error));
+    report(engine, "flush", flushed);
+    observe(engine, turn).await;
+}
+
+/// Resumes the payments left open (`Paykit::resume_payments`) and returns their outcomes
+/// (`PayOutcome` in the declarations): a payment a restart interrupted, or one whose host `pay`
+/// answered late, is finished and its proof sent. Emits `paymentsResumed` when there are
+/// outcomes, then the changes they made. While an outcome still waits on the method, the feed
+/// loop resumes again at its next turn.
+pub async fn resume(engine: &Rc<Engine>) -> Result<Vec<Value>, EngineError> {
+    let mut turn = Turn::take(engine).await?;
+    engine.flights.take_arrived();
+    let resumed = Box::pin(turn.paykit.resume_payments()).await;
+    let result = match resumed {
+        Ok(outcomes) => {
+            engine
+                .payments_open
+                .set(outcomes.iter().any(views::outcome_waits));
+            let list: Vec<Value> = outcomes.iter().map(views::pay_outcome).collect();
+            if !list.is_empty() {
+                engine
+                    .events
+                    .emit("paymentsResumed", json!({ "outcomes": list.clone() }));
+            }
+            Ok(list)
+        }
+        Err(error) => {
+            engine.payments_open.set(true);
+            Err(EngineError::sdk("resume the payments", &error))
+        }
+    };
+    observe(engine, &turn).await;
+    result
+}
+
 /// Compares the requests and the payee activity with what was seen before, and emits an event
 /// for each change.
-async fn observe(engine: &Engine, turn: &Turn) {
+pub async fn observe(engine: &Engine, turn: &Turn) {
     match requests(turn).await {
         Ok(views) => {
             report(engine, "requests", Ok(()));
@@ -268,7 +320,7 @@ async fn observe(engine: &Engine, turn: &Turn) {
         Err(error) => report(
             engine,
             "payeeActivity",
-            Err(EngineError::paykit("read the payee activity", &error)),
+            Err(EngineError::sdk("read the payee activity", &error)),
         ),
     }
 }
@@ -359,6 +411,13 @@ async fn run(engine: &Rc<Engine>) -> &'static str {
                 }
             }
         }
+        if engine.payments_open.get() || engine.flights.take_arrived() {
+            if engine.stop.is_raised() {
+                return "stopped";
+            }
+            let resumed = resume(engine).await.map(|_| ());
+            report(engine, "resumePayments", resumed);
+        }
         if Date::now() >= engine.signer_due_at.get() {
             let Ok(mut turn) = Turn::take(engine).await else {
                 return "stopped";
@@ -373,8 +432,18 @@ async fn run(engine: &Rc<Engine>) -> &'static str {
         };
         let asked = wait.seconds();
         let started = Date::now();
-        let Some(woken) = engine.stop.unless_raised(wait.wait()).await else {
-            return "stopped";
+        let woken = engine
+            .stop
+            .unless_raised(first_of(wait.wait(), engine.flights.arrival()))
+            .await;
+        let woken = match woken {
+            None => return "stopped",
+            // A `pay` answered late: resume the payments now, then wait again.
+            Some(None) => {
+                read = false;
+                continue;
+            }
+            Some(Some(woken)) => woken,
         };
         let took = Duration::from_millis((Date::now() - started).max(0.0) as u64);
         if let Some(pause) = pace.after_wait(woken, asked, took) {
@@ -384,6 +453,23 @@ async fn run(engine: &Rc<Engine>) -> &'static str {
         }
         read = woken != Woken::Quiet;
     }
+}
+
+/// Runs `main` until it completes, or until `interrupt` does first: `None` then, and `main` is
+/// dropped, which cancels it.
+async fn first_of<F: Future>(main: F, interrupt: impl Future<Output = ()>) -> Option<F::Output> {
+    let mut main = pin!(main);
+    let mut interrupt = pin!(interrupt);
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = main.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        if interrupt.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 fn millis(duration: Duration) -> u64 {

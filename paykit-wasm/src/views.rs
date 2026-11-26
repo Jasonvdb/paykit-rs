@@ -13,7 +13,10 @@
 
 use std::fmt::Debug;
 
-use paykit_sdk::{PayeeActivity, PaymentAmount, ReceivedReceipt, RequestDestination, RequestView};
+use paykit_sdk::{
+    PayOutcome, PayeeActivity, PaymentAmount, PaymentView, ReceivedReceipt, RequestDestination,
+    RequestView, SentRequest,
+};
 use pubky_dispatch_core::enc::{b64, pubky_id, pubky_key};
 use serde_json::{json, Value};
 
@@ -128,6 +131,65 @@ pub fn payee_activity(activity: &PayeeActivity) -> Value {
         "status": case_name(&activity.status),
         "divergent": activity.divergent,
         "recurring": activity.recurring,
+    })
+}
+
+/// A request just sent (FFI `SentRequest`): `{msgId, delivery, request}`, `delivery` the case
+/// of where the message stands (`accepted`, `queued`, `kept`, `waitingForAdmission`, ...) and
+/// `request` its `{payee, requestHash}`.
+pub fn sent_request(sent: &SentRequest) -> Value {
+    json!({
+        "msgId": sent.msg_id,
+        "delivery": case_name(&sent.delivery),
+        "request": sent.request.as_ref().map(|r| request_id(&r.payee, &r.request_hash)),
+    })
+}
+
+/// A payment's outcome (FFI `PaymentOutcome`): `{outcome, attemptId}`, with `proofMessageId`
+/// for `paid` and `reason` for `failed`. `outcome` is the case in lowerCamelCase: `paid`,
+/// `pending`, `failed`, `uncertain`, `paidUnreported`, `paidOutcomeUnwritten`,
+/// `recordHeld`, `recordDivergent` or `resolved`.
+pub fn pay_outcome(outcome: &PayOutcome) -> Value {
+    let mut view = json!({
+        "outcome": case_name(outcome),
+        "attemptId": outcome.attempt_id().to_text(),
+    });
+    match outcome {
+        PayOutcome::Paid { proof_msg_id, .. } => {
+            view["proofMessageId"] = json!(proof_msg_id);
+        }
+        PayOutcome::Failed { reason, .. } => {
+            view["reason"] = json!(reason);
+        }
+        _ => {}
+    }
+    view
+}
+
+/// Whether `outcome` still waits on the payment method or the network, so a resume later
+/// may finish it with no one acting.
+pub fn outcome_waits(outcome: &PayOutcome) -> bool {
+    matches!(
+        outcome,
+        PayOutcome::Pending { .. } | PayOutcome::PaidOutcomeUnwritten { .. }
+    )
+}
+
+/// A payment in the payer's journal (FFI `PaymentEntry`): `{attemptId, payee, requestHash,
+/// amount, endpoint, stage, paidByMethod, recordHeld, paid, receipt}`. `stage` is the case in
+/// lowerCamelCase (`paying`, `railPaid`, `finished`, ...).
+pub fn payment(view: &PaymentView) -> Value {
+    json!({
+        "attemptId": view.attempt_id.to_text(),
+        "payee": pubky_id(&view.payee),
+        "requestHash": view.request_hash.as_ref().map(|hash| hex(hash)),
+        "amount": amount(&view.amount),
+        "endpoint": view.endpoint_id.as_str(),
+        "stage": case_name(&view.stage),
+        "paidByMethod": view.paid_by_method,
+        "recordHeld": view.record_held,
+        "paid": view.paid.as_ref().map(amount),
+        "receipt": view.receipt.as_ref().map(receipt),
     })
 }
 

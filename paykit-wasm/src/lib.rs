@@ -20,7 +20,16 @@
 //!   payee it expects requests from (Dispatch spec 7). `admits(identity)` and `contacts()`
 //!   read the admission state.
 //! - `requests()`: the one-time requests this identity holds as payer; `payeeActivity()`: the
-//!   requests it sent and the payments it received as payee.
+//!   requests it sent and the payments it received as payee; `payments()`: the payer's
+//!   payments, with their receipts; `requestReceipts(id)`: the receipts of one request.
+//! - Payee: `sendRequest(request)` signs and sends a Payment Request, to endpoints the host
+//!   supplies (such as a fresh address) or to any of the identity's endpoints;
+//!   `verifyPayment(record)` checks a received proof with the host's `rail.verify`;
+//!   `confirmPayment(record)` verifies it and sends the payer a receipt;
+//!   `cancelSentRequest(record)`.
+//! - Payer: `payRequest(id)` pays a request through the host's `rail.pay` and sends the proof;
+//!   `rejectRequest(id)`; `resumePayments()` finishes payments left open, which the feed loop
+//!   also does after a start and whenever a slow `pay` answers.
 //! - `receive()`: one receive round, for a host that drives the feed itself.
 //! - `signerTick()`: the signer's due work, which the feed loop also runs once a minute.
 //! - `stop()`: closes the signer and the app, releasing their stores.
@@ -32,9 +41,10 @@
 //!
 //! A failed call rejects (or throws) an `Error` whose message is `<code>: <text>`, with the
 //! codes `bad_options`, `already_started`, `not_started`, `busy`, `store`,
-//! `identity_mismatch`, `signer`, `enrolment`, `paykit`, `invalid_input` and `homeserver`
-//! (`error.rs`). Calls made while another runs wait their turn; `busy` means the engine is
-//! starting or stopping.
+//! `identity_mismatch`, `signer`, `enrolment`, `paykit`, `invalid_input`, `homeserver`,
+//! `refused`, `rail` and `conflict` (`error.rs`). The `Error` carries the code as `code`, and
+//! for `refused` the refusal's name as `reason`. Calls made while another runs wait their
+//! turn; `busy` means the engine is starting or stopping.
 //!
 //! **Demo shortcut.** The host passes the identity's secret key to `start`, and the signer runs
 //! in the same worker as the app. Pubky's direction keeps identity keys out of apps; the engine
@@ -59,9 +69,13 @@ mod events;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod feed;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod flights;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod homeserver;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod host;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod inputs;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod options;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -86,16 +100,18 @@ mod api {
     use js_sys::{Array, JSON};
     use pubky_dispatch_core::enc::{b64, pubky_id};
     use serde_json::{json, Value};
-    use wasm_bindgen::prelude::{wasm_bindgen, JsError, JsValue};
+    use wasm_bindgen::prelude::{wasm_bindgen, JsValue};
 
     use crate::engine::{destroy_store, Engine, SIGNER_FILES};
     use crate::error::EngineError;
     use crate::feed::{self, RoundError};
+    use crate::inputs;
     use crate::options::{
         app_store_name, signer_store_name, HomeserverCallbacks, ResetOptions, StartOptions,
     };
     use crate::turn::Turn;
     use crate::views::{self, Admission};
+    use paykit_sdk::ReceiptsOf;
 
     #[wasm_bindgen(typescript_custom_section)]
     const TYPES: &'static str = r#"
@@ -151,6 +167,13 @@ export interface RailProofCheck {
  * refused, nothing sent). */
 export interface EngineRail {
   endpoints: EndpointSupport[];
+  /** How long a payment waits for `pay`, in ms: 1,000 to 3,600,000, default 60,000. Past it
+   * `pay` goes on by itself, the attempt stays open (`payRequest` resolves `pending`), and
+   * the engine finishes the payment when `pay` answers. */
+  payLimitMs?: number;
+  /** Must answer `{status: "paid"}` or `{status: "failed"}` once the payment is decided, and
+   * may take as long as the method needs. The engine never calls it twice at once for one
+   * `attemptId`, and a repeat with an `attemptId` already paid must return that payment. */
   pay?(payment: RailPayment): Promise<RailOutcome>;
   /** `null` only when `pay` was never called with `attemptId`. */
   payment?(attemptId: string): Promise<RailOutcome | null>;
@@ -236,6 +259,64 @@ export interface OneTimeRequest {
   destination: RequestDestination;
 }
 
+/** A Payment Request to send (`sendRequest`). */
+export interface RequestInput {
+  /** The payer's Pubky ID. The payer must admit this identity (its `allowConnect`). */
+  to: string;
+  amount: RailAmount;
+  /** The payer sees it with the request, and it is copied into the receipt: 1 to 256
+   * characters, no control characters. */
+  paymentReference: string;
+  /** Where to pay: endpoints the host supplies, such as `[{identifier: "btc-regtest-p2tr",
+   * payload: "{\"value\":\"<address>\"}"}]`; or any current endpoint of the identity. */
+  destination: RequestDestination;
+  /** The last time the payer may act on it, in Unix ms. */
+  proposalExpiresAtMs?: number;
+  /** The deadline of the payment itself, in Unix ms. */
+  paymentDeadlineMs?: number;
+}
+
+/** A request just sent. `delivery`: `accepted` (in the payer's inbox), `queued`, `kept`,
+ * `waitingForAdmission` (the payer does not admit this identity yet), ... */
+export interface SentRequest {
+  msgId: string;
+  delivery: string;
+  request: RequestId | null;
+}
+
+/** The options of `payRequest`. */
+export interface PayRequestOptions {
+  /** The Payment Endpoint Identifier to pay; the first usable one otherwise. */
+  endpoint?: string;
+}
+
+/** What became of a payment (paykit-ffi `PaymentOutcome`): `paid` (the proof is sent or
+ * queued), `pending` (the method has not answered yet; the engine finishes it when it does),
+ * `failed` (definitely not paid), `uncertain` (may be paid: the user decides), and the rarer
+ * `paidUnreported`, `paidOutcomeUnwritten`, `recordHeld`, `recordDivergent`, `resolved`. */
+export interface PaymentOutcome {
+  outcome: string;
+  attemptId: string;
+  proofMessageId?: string | null;
+  reason?: string;
+}
+
+/** A payment in the payer's journal (paykit-ffi `PaymentEntry`). */
+export interface PaymentEntry {
+  attemptId: string;
+  payee: string;
+  requestHash: string | null;
+  amount: RailAmount;
+  endpoint: string;
+  /** `recorded`, `attempted`, `paying`, `railPaid`, `railFailed`, `acceptanceOwed`,
+   * `finished` or `abandoned`. */
+  stage: string;
+  paidByMethod: boolean;
+  recordHeld: boolean;
+  paid: RailAmount | null;
+  receipt: Receipt | null;
+}
+
 /** What the payee sees (paykit-ffi `PayeeStatus`). */
 export type PayeeStatus =
   | "requested" | "accepted" | "rejected" | "cancelled" | "proofReceived" | "receipted"
@@ -292,6 +373,7 @@ export type EngineEvent = { atMs: number } & (
   | { type: "receiptReceived"; request: OneTimeRequest; receipt: Receipt }
   | { type: "proofReceived"; activity: PayeeRequest }
   | { type: "activityUpdated"; activity: PayeeRequest; previousStatus: string | null }
+  | { type: "paymentsResumed"; outcomes: PaymentOutcome[] }
   | { type: "error"; during: string; code: string; message: string }
   | { type: "feedStopped"; reason: string }
 );
@@ -362,7 +444,7 @@ export interface ResetOptions {
     #[wasm_bindgen(unchecked_return_type = "StartResult")]
     pub async fn start(
         #[wasm_bindgen(unchecked_param_type = "StartOptions")] options: JsValue,
-    ) -> Result<JsValue, JsError> {
+    ) -> Result<JsValue, JsValue> {
         let options = StartOptions::read(&options)?;
         SLOT.with_borrow_mut(|slot| match slot {
             Slot::Empty => {
@@ -401,7 +483,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, or `busy` while the engine starts or stops.
     #[wasm_bindgen]
-    pub fn identity() -> Result<String, JsError> {
+    pub fn identity() -> Result<String, JsValue> {
         Ok(pubky_id(&engine()?.identity))
     }
 
@@ -411,7 +493,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, or `busy` while the engine starts or stops.
     #[wasm_bindgen(js_name = appId)]
-    pub fn app_id() -> Result<String, JsError> {
+    pub fn app_id() -> Result<String, JsValue> {
         Ok(b64(&engine()?.app_id))
     }
 
@@ -424,13 +506,13 @@ export interface ResetOptions {
     ///
     /// `invalid_input` for a malformed Pubky ID, `not_started`, `busy`, or `paykit`.
     #[wasm_bindgen(js_name = allowConnect)]
-    pub async fn allow_connect(identity: String) -> Result<(), JsError> {
+    pub async fn allow_connect(identity: String) -> Result<(), JsValue> {
         let peer = views::identity_key(&identity)?;
         let engine = engine()?;
         let mut turn = Turn::take(&engine).await?;
         Box::pin(turn.paykit.allow_connect(&peer))
             .await
-            .map_err(|error| EngineError::paykit("allow the identity to connect", &error))?;
+            .map_err(|error| EngineError::sdk("allow the identity to connect", &error))?;
         let admitted = Box::pin(turn.paykit.app().admits(&peer))
             .await
             .map_err(|error| EngineError::paykit("read the admission", &error))?;
@@ -455,7 +537,7 @@ export interface ResetOptions {
     ///
     /// `invalid_input`, `not_started`, `busy`, or `paykit`.
     #[wasm_bindgen]
-    pub async fn admits(identity: String) -> Result<bool, JsError> {
+    pub async fn admits(identity: String) -> Result<bool, JsValue> {
         let peer = views::identity_key(&identity)?;
         let engine = engine()?;
         let turn = Turn::take(&engine).await?;
@@ -472,7 +554,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, `busy`, or `paykit`.
     #[wasm_bindgen(unchecked_return_type = "Contacts")]
-    pub async fn contacts() -> Result<JsValue, JsError> {
+    pub async fn contacts() -> Result<JsValue, JsValue> {
         let engine = engine()?;
         let mut turn = Turn::take(&engine).await?;
         let list = Box::pin(turn.paykit.app_mut().allow_list())
@@ -504,7 +586,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, `busy`, or `paykit` (also while the app's first listing is not done).
     #[wasm_bindgen(unchecked_return_type = "OneTimeRequest[]")]
-    pub async fn requests() -> Result<JsValue, JsError> {
+    pub async fn requests() -> Result<JsValue, JsValue> {
         let engine = engine()?;
         let turn = Turn::take(&engine).await?;
         let views = feed::requests(&turn).await?;
@@ -520,14 +602,211 @@ export interface ResetOptions {
     ///
     /// `not_started`, `busy`, or `paykit`.
     #[wasm_bindgen(js_name = payeeActivity, unchecked_return_type = "PayeeRequest[]")]
-    pub async fn payee_activity() -> Result<JsValue, JsError> {
+    pub async fn payee_activity() -> Result<JsValue, JsValue> {
         let engine = engine()?;
         let turn = Turn::take(&engine).await?;
         let activity = Box::pin(turn.paykit.payee_activity())
             .await
-            .map_err(|error| EngineError::paykit("read the payee activity", &error))?;
+            .map_err(|error| EngineError::sdk("read the payee activity", &error))?;
         drop(turn);
         let list: Vec<Value> = activity.iter().map(views::payee_activity).collect();
+        Ok(to_js(&Value::Array(list)))
+    }
+
+    /// Signs and sends a Payment Request (`RequestInput`) as payee, records it, and tries to
+    /// deliver it at once. Resolves to `SentRequest`; the payee activity shows the request
+    /// from now on (`activityUpdated`, status `requested`).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input` for a malformed request; `refused` (such as `reason` `scopeMissing`,
+    /// `heldForUser` or `notNow`); `not_started`, `busy`, or `paykit`. After a `paykit` error
+    /// read `payeeActivity()` before sending it again: the request may have been kept.
+    #[wasm_bindgen(js_name = sendRequest, unchecked_return_type = "SentRequest")]
+    pub async fn send_request(
+        #[wasm_bindgen(unchecked_param_type = "RequestInput")] request: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let input = inputs::request_input(&request)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let sent = Box::pin(turn.paykit.send_request(input.to, input.draft))
+            .await
+            .map_err(|error| EngineError::sdk("send the request", &error))?;
+        feed::deliver(&engine, &mut turn).await;
+        Ok(to_js(&views::sent_request(&sent)))
+    }
+
+    /// Pays the request `id` (`RequestId`) as payer: the SDK writes the attempt, the host's
+    /// `rail.pay` pays it, and the proof is sent to the payee. Resolves to `PaymentOutcome`:
+    /// `paid` once the method paid within the pay limit, `pending` when it has not answered
+    /// yet (the engine finishes the payment when it does: `paymentsResumed`).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` when the request is not payable, nothing paid, with
+    /// `reason` such as `alreadyPaid`, `paymentInProgress`, `rejected`, `cancelled`,
+    /// `noDestination`, `unsupportedEndpoint` or `attemptFailed`; `conflict`; `not_started`,
+    /// `busy`, or `paykit`. A failure after money may have moved is never an error: it is the
+    /// `pending` or `uncertain` outcome.
+    #[wasm_bindgen(js_name = payRequest, unchecked_return_type = "PaymentOutcome")]
+    pub async fn pay_request(
+        #[wasm_bindgen(unchecked_param_type = "RequestId")] id: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "PayRequestOptions")] options: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let request = inputs::request_ref(&id)?;
+        let options = inputs::pay_options(&options)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let result = Box::pin(turn.paykit.pay_request(&request, options)).await;
+        let outcome = match result.outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                feed::observe(&engine, &turn).await;
+                return Err(EngineError::sdk("pay the request", &error).into());
+            }
+        };
+        if views::outcome_waits(&outcome) {
+            engine.payments_open.set(true);
+        }
+        feed::deliver(&engine, &mut turn).await;
+        Ok(to_js(&views::pay_outcome(&outcome)))
+    }
+
+    /// Rejects the request `id` as payer, with an optional `reason` the payee sees, and
+    /// resolves to the rejection's message ID.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` (`notFound`, `alreadyPaid`, `paymentInProgress`, ...);
+    /// `conflict`; `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = rejectRequest)]
+    pub async fn reject_request(
+        #[wasm_bindgen(unchecked_param_type = "RequestId")] id: JsValue,
+        reason: Option<String>,
+    ) -> Result<String, JsValue> {
+        let request = inputs::request_ref(&id)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let msg_id = Box::pin(turn.paykit.reject_request(&request, reason))
+            .await
+            .map_err(|error| EngineError::sdk("reject the request", &error))?;
+        feed::deliver(&engine, &mut turn).await;
+        Ok(msg_id)
+    }
+
+    /// Checks the proof the payee activity record `record` (hex) holds with the host's
+    /// `rail.verify`, against the request's destination, amount and times. Resolves to the
+    /// verified payment time in Unix ms, or `null` when the method does not confirm it, or
+    /// the settlement is credited to another payment already.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` (`notFound` for a record without a proof,
+    /// `paymentTimeOutside`, `maybeCredited`, ...); `rail` when the method could not check it
+    /// now; `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = verifyPayment, unchecked_return_type = "number | null")]
+    pub async fn verify_payment(record: String) -> Result<JsValue, JsValue> {
+        let record = inputs::record_key(&record)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let verified = Box::pin(turn.paykit.verify_payment(&record))
+            .await
+            .map_err(|error| EngineError::sdk("verify the payment", &error))?;
+        Ok(verified.map_or(JsValue::NULL, |at| JsValue::from_f64(at as f64)))
+    }
+
+    /// Verifies the payment in the payee activity record `record` (hex) as `verifyPayment`
+    /// does and, when the method confirms it, sends the payer a receipt. Resolves to the
+    /// receipt's message ID (the same one on a repeat), or `null` when the payment is not
+    /// confirmed. The record's status becomes `receipted`.
+    ///
+    /// # Errors
+    ///
+    /// As `verifyPayment`, and `refused` `divergent`.
+    #[wasm_bindgen(js_name = confirmPayment, unchecked_return_type = "string | null")]
+    pub async fn confirm_payment(record: String) -> Result<JsValue, JsValue> {
+        let record = inputs::record_key(&record)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let receipt = Box::pin(turn.paykit.confirm_payment(&record))
+            .await
+            .map_err(|error| EngineError::sdk("confirm the payment", &error))?;
+        feed::deliver(&engine, &mut turn).await;
+        Ok(receipt.map_or(JsValue::NULL, |id| JsValue::from_str(&id)))
+    }
+
+    /// Cancels the request this identity sent whose payee activity record is `record` (hex),
+    /// with an optional `reason`, and resolves to the cancellation's message ID. A proof that
+    /// crosses it still counts.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused`; `conflict`; `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = cancelSentRequest)]
+    pub async fn cancel_sent_request(
+        record: String,
+        reason: Option<String>,
+    ) -> Result<String, JsValue> {
+        let record = inputs::record_key(&record)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let msg_id = Box::pin(turn.paykit.cancel_sent_request(&record, reason))
+            .await
+            .map_err(|error| EngineError::sdk("cancel the request", &error))?;
+        feed::deliver(&engine, &mut turn).await;
+        Ok(msg_id)
+    }
+
+    /// The payer's payments, from its journal (`PaymentEntry[]`), each with the payee's
+    /// receipt once it came.
+    ///
+    /// # Errors
+    ///
+    /// `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(unchecked_return_type = "PaymentEntry[]")]
+    pub async fn payments() -> Result<JsValue, JsValue> {
+        let engine = engine()?;
+        let turn = Turn::take(&engine).await?;
+        let payments = Box::pin(turn.paykit.payments())
+            .await
+            .map_err(|error| EngineError::sdk("read the payments", &error))?;
+        drop(turn);
+        let list: Vec<Value> = payments.iter().map(views::payment).collect();
+        Ok(to_js(&Value::Array(list)))
+    }
+
+    /// Finishes the payments left open now (`PaymentOutcome[]`): one a restart interrupted,
+    /// or one whose method answered after the pay limit. The feed loop does it by itself once
+    /// after `start` and whenever a late answer comes; a host that drives the feed itself
+    /// (`autoReceive: false`) calls it.
+    ///
+    /// # Errors
+    ///
+    /// `not_started`, `busy`, `rail`, or `paykit`.
+    #[wasm_bindgen(js_name = resumePayments, unchecked_return_type = "PaymentOutcome[]")]
+    pub async fn resume_payments() -> Result<JsValue, JsValue> {
+        let engine = engine()?;
+        let outcomes = feed::resume(&engine).await?;
+        Ok(to_js(&Value::Array(outcomes)))
+    }
+
+    /// The payee's receipts of the request `id` the payer holds (`Receipt[]`).
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`, `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = requestReceipts, unchecked_return_type = "Receipt[]")]
+    pub async fn request_receipts(
+        #[wasm_bindgen(unchecked_param_type = "RequestId")] id: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let request = inputs::request_ref(&id)?;
+        let engine = engine()?;
+        let turn = Turn::take(&engine).await?;
+        let receipts = Box::pin(turn.paykit.receipts(ReceiptsOf::Request(request)))
+            .await
+            .map_err(|error| EngineError::sdk("read the receipts", &error))?;
+        drop(turn);
+        let list: Vec<Value> = receipts.iter().map(views::receipt).collect();
         Ok(to_js(&Value::Array(list)))
     }
 
@@ -538,7 +817,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, `busy`, or `paykit` when the read failed.
     #[wasm_bindgen(unchecked_return_type = "ReceiveResult")]
-    pub async fn receive() -> Result<JsValue, JsError> {
+    pub async fn receive() -> Result<JsValue, JsValue> {
         let engine = engine()?;
         match feed::round(&engine).await {
             Ok(summary) => Ok(to_js(&summary)),
@@ -555,7 +834,7 @@ export interface ResetOptions {
     ///
     /// `not_started`, `busy`, or `signer`.
     #[wasm_bindgen(js_name = signerTick, unchecked_return_type = "SignerTick")]
-    pub async fn signer_tick() -> Result<JsValue, JsError> {
+    pub async fn signer_tick() -> Result<JsValue, JsValue> {
         let engine = engine()?;
         let mut turn = Turn::take(&engine).await?;
         let more_due = feed::run_signer(&engine, &mut turn).await?;
@@ -570,11 +849,11 @@ export interface ResetOptions {
     /// `not_started`, `busy` while the engine starts or stops, or `signer` when the signer
     /// could not close cleanly; the engine is stopped either way.
     #[wasm_bindgen]
-    pub async fn stop() -> Result<(), JsError> {
+    pub async fn stop() -> Result<(), JsValue> {
         let engine = take_engine()?;
         let stopped = close(&engine).await;
         SLOT.set(Slot::Empty);
-        stopped.map_err(JsError::from)
+        stopped.map_err(JsValue::from)
     }
 
     /// For tests: removes this worker's engine and the identity's enrolment state, so the
@@ -594,7 +873,7 @@ export interface ResetOptions {
     #[wasm_bindgen(js_name = resetIdentity)]
     pub async fn reset_identity(
         #[wasm_bindgen(unchecked_param_type = "ResetOptions | undefined")] options: JsValue,
-    ) -> Result<(), JsError> {
+    ) -> Result<(), JsValue> {
         let options = ResetOptions::read(&options)?;
         let running = SLOT.with_borrow_mut(|slot| match slot {
             Slot::Ready(engine) => {
@@ -637,7 +916,7 @@ export interface ResetOptions {
         };
         let result = reset.await;
         SLOT.set(Slot::Empty);
-        result.map_err(JsError::from)
+        result.map_err(JsValue::from)
     }
 
     /// Takes the started engine out of the slot for a stop.

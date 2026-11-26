@@ -16,10 +16,15 @@
 //!
 //! - `pay(payment) -> Promise<RailOutcome>`, where `payment` is `{attemptId, endpointId,
 //!   payload, amount: {value, asset}, paymentReference}`. The attempt ID is the idempotency
-//!   key. A call that throws, rejects or takes longer than a minute leaves the attempt open:
-//!   the SDK asks `payment` later.
+//!   key. A call that throws or rejects leaves the attempt open: the SDK asks `payment` later.
+//!   A call may take long, such as an on-chain payment that waits for a shared pool's round:
+//!   the SDK waits for it up to the pay limit (`rail.payLimitMs`, a minute by default), and
+//!   past it the call goes on as a task of its own, the attempt stays open, and its answer is
+//!   recorded when it comes (`flights.rs`).
 //! - `payment(attemptId) -> Promise<RailOutcome | null>`: `null` only when `pay` was never
-//!   called with that ID; `{status: "pending"}` for one in flight.
+//!   called with that ID; `{status: "pending"}` for one in flight. While this engine's own
+//!   `pay` call for the attempt runs, the engine answers "pending" itself; the host is asked
+//!   after a restart, or once that call ended without an answer.
 //! - `verify(check) -> Promise<number | null>`, where `check` is `{endpointId, payload,
 //!   amount, attemptId, proof}`: the verified payment time in Unix milliseconds, or `null`.
 //!
@@ -38,6 +43,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use wasm_bindgen::JsValue;
 
+use crate::flights::{Flights, Waited, STALE_AFTER};
 use crate::host::{self, CallError};
 use crate::options::RailCallbacks;
 
@@ -45,8 +51,9 @@ use crate::options::RailCallbacks;
 const LONGEST_COMPLETION_MS: u64 = 3_600_000;
 /// How far a verified paid time may lie outside a request's times, in milliseconds.
 const PAYMENT_TIME_TOLERANCE_MS: u64 = 300_000;
-/// How long `pay` may take before the attempt is left open, in milliseconds.
-const PAY_LIMIT_MS: u64 = 60_000;
+/// How long the SDK waits for `pay` before the attempt is left open and the call goes on by
+/// itself, in milliseconds, unless the host sets `rail.payLimitMs`.
+pub const DEFAULT_PAY_LIMIT_MS: u64 = 60_000;
 /// How long `payment` and `verify` may take, in milliseconds.
 const LOOKUP_LIMIT_MS: u64 = 30_000;
 
@@ -54,14 +61,26 @@ const LOOKUP_LIMIT_MS: u64 = 30_000;
 pub struct JsRail {
     endpoints: Vec<(PaymentEndpointIdentifier, u32)>,
     callbacks: RailCallbacks,
+    /// How long the SDK waits for one `pay` call.
+    pay_limit_ms: u64,
+    /// The `pay` calls in progress and their late answers, shared with the feed loop.
+    flights: Flights,
 }
 
 impl JsRail {
-    /// The host's method, paying `endpoints`, each with its fraction digits.
-    pub fn new(endpoints: Vec<(PaymentEndpointIdentifier, u32)>, callbacks: RailCallbacks) -> Self {
+    /// The host's method, paying `endpoints`, each with its fraction digits; the SDK waits
+    /// `pay_limit_ms` for one `pay`, and `flights` keeps the calls that outlast it.
+    pub fn new(
+        endpoints: Vec<(PaymentEndpointIdentifier, u32)>,
+        callbacks: RailCallbacks,
+        pay_limit_ms: u64,
+        flights: Flights,
+    ) -> Self {
         Self {
             endpoints,
             callbacks,
+            pay_limit_ms,
+            flights,
         }
     }
 
@@ -88,17 +107,18 @@ impl JsRail {
             let value = host::call(&function, &Array::of1(&argument), limit_ms).await?;
             to_json(&value).ok_or_else(|| CallError::Failed("its value is not JSON".into()))
         });
-        Box::pin(async move {
-            call.await.map_err(|error| match error {
-                CallError::TimedOut => {
-                    RailError::Unavailable(format!("rail.{name} did not answer in time"))
-                }
-                CallError::Failed(text) => {
-                    RailError::Unavailable(format!("rail.{name} failed: {text}"))
-                }
-                CallError::Dropped => RailError::Unavailable(format!("rail.{name} was dropped")),
-            })
-        })
+        Box::pin(async move { call.await.map_err(|error| unavailable(name, error)) })
+    }
+}
+
+/// A host call's failure as the SDK reads it: nothing yet, the attempt stays open.
+fn unavailable(name: &str, error: CallError) -> RailError {
+    match error {
+        CallError::TimedOut => {
+            RailError::Unavailable(format!("rail.{name} did not answer in time"))
+        }
+        CallError::Failed(text) => RailError::Unavailable(format!("rail.{name} failed: {text}")),
+        CallError::Dropped => RailError::Unavailable(format!("rail.{name} was dropped")),
     }
 }
 
@@ -206,32 +226,70 @@ impl Rail for JsRail {
     }
 
     fn pay(&self, payment: RailPayment) -> BoxFuture<'_, Result<RailOutcome, RailError>> {
-        if self.callbacks.pay.is_none() {
+        let Some(function) = self.callbacks.pay.clone() else {
             // Nothing was submitted, and nothing will be.
             return Box::pin(std::future::ready(Err(RailError::Refused(
                 "the host gave no rail.pay callback".into(),
             ))));
-        }
+        };
+        let attempt = payment.idempotency_key.to_text();
         let argument = json!({
-            "attemptId": payment.idempotency_key.to_text(),
+            "attemptId": attempt,
             "endpointId": payment.endpoint_id.as_str(),
             "payload": payment.payload.as_str(),
             "amount": amount_json(&payment.amount),
             "paymentReference": payment.payment_reference,
         });
-        let call = Self::call_host(self.callbacks.pay.as_ref(), "pay", argument, PAY_LIMIT_MS);
-        Box::pin(async move { outcome(call.await?, "pay") })
+        let Some(call) = self.flights.start(&attempt, self.pay_limit_ms) else {
+            // The same attempt's call is in flight at the host: pending, not a second payment.
+            return Box::pin(std::future::ready(Ok(RailOutcome::Pending)));
+        };
+        // The host's call runs as a task of its own, to its end, whatever the SDK does: its
+        // answer goes to the SDK while it waits, and is kept for the next resume after.
+        let flights = self.flights.clone();
+        let task_attempt = attempt.clone();
+        let longest = self.pay_limit_ms.saturating_mul(STALE_AFTER);
+        wasm_bindgen_futures::spawn_local(async move {
+            let answer = async {
+                let argument = JSON::parse(&argument.to_string())
+                    .map_err(|_| CallError::Failed("the argument does not convert".into()))?;
+                let value = host::call(&function, &Array::of1(&argument), longest).await?;
+                to_json(&value).ok_or_else(|| CallError::Failed("its value is not JSON".into()))
+            }
+            .await;
+            flights.finish(&task_attempt, call, answer);
+        });
+        let flights = self.flights.clone();
+        let limit = self.pay_limit_ms;
+        Box::pin(async move {
+            match flights.handoff(&attempt, call, limit).await {
+                Waited::Answered(Ok(value)) => outcome(value, "pay"),
+                Waited::Answered(Err(error)) => Err(unavailable("pay", error)),
+                // The SDK keeps the attempt open: nothing yet, possibly sent (Paykit spec 7.2).
+                Waited::StillRunning => Err(RailError::Unavailable(
+                    "rail.pay is still paying; its answer is recorded when it comes".into(),
+                )),
+            }
+        })
     }
 
     fn payment(
         &self,
         idempotency_key: AttemptId,
     ) -> BoxFuture<'_, Result<Option<RailOutcome>, RailError>> {
-        let argument = Value::String(idempotency_key.to_text());
+        let attempt = idempotency_key.to_text();
+        // In flight at the host: pending, and the host is not asked while its `pay` runs.
+        if self.flights.in_flight(&attempt) {
+            return Box::pin(std::future::ready(Ok(Some(RailOutcome::Pending))));
+        }
+        // The host's own late answer, kept until the journal records it.
+        if let Some(value) = self.flights.late(&attempt) {
+            return Box::pin(std::future::ready(outcome(value, "pay").map(Some)));
+        }
         let call = Self::call_host(
             self.callbacks.payment.as_ref(),
             "payment",
-            argument,
+            Value::String(attempt),
             LOOKUP_LIMIT_MS,
         );
         Box::pin(async move {
