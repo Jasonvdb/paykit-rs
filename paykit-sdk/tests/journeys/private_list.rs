@@ -139,14 +139,28 @@ async fn updated_then_withdrawn(world: &World) -> TestResult {
     } = Box::pin(checkout(world, PaykitConfig::default())).await?;
     let seller = shop.identity();
 
-    // Before any list, the payment waits for one.
+    // Before any list, the payment waits for one, and neither side shows a list.
     Box::pin(refused(&mut wallet, &rail, seller, |refusal| {
         matches!(refusal, Refusal::WaitingForList { .. })
     }))
     .await?;
+    assert!(Box::pin(wallet.received_lists()).await?.is_empty());
+    let unset = Box::pin(shop.shared_list()).await?;
+    assert_eq!(unset.endpoints, None);
+    assert!(unset.recipients.is_empty());
 
     // The seller shares a list, then updates it; each time the payer pays the current one.
     Box::pin(shared(&mut wallet, &mut shop, "lno1first")).await?;
+    let sharing = Box::pin(shop.shared_list()).await?;
+    assert_eq!(sharing.endpoints, Some(offer("lno1first")?));
+    assert_eq!(sharing.recipients, vec![wallet.identity()]);
+    let held = Box::pin(wallet.received_lists()).await?;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].payee, seller);
+    assert_eq!(held[0].app_id, shop.app_id());
+    assert_eq!(held[0].endpoints, offer("lno1first")?);
+    assert!(held[0].accepted_at_ms.is_some());
+    let first_version = held[0].version;
     Box::pin(pay_from_list(
         &mut wallet,
         &mut shop,
@@ -164,10 +178,18 @@ async fn updated_then_withdrawn(world: &World) -> TestResult {
         "lno1second",
     ))
     .await?;
+    let held = Box::pin(wallet.received_lists()).await?;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].endpoints, offer("lno1second")?);
+    assert!(held[0].version > first_version);
 
     // The seller withdraws the list; the payer has nothing left to pay at.
     Box::pin(shop.withdraw_list_from(wallet.identity())).await?;
     Box::pin(wallet.receive(None)).await?;
+    assert!(Box::pin(shop.shared_list()).await?.recipients.is_empty());
+    let held = Box::pin(wallet.received_lists()).await?;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(held[0].endpoints.is_empty(), "{held:?}");
     Box::pin(refused(&mut wallet, &rail, seller, |refusal| {
         matches!(refusal, Refusal::NoDestination(_))
     }))

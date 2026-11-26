@@ -205,6 +205,26 @@ impl UnknownListDelivery {
     }
 }
 
+/// The reusable Private Payment List this app shares, and with whom ([`Paykit::shared_list`];
+/// Paykit spec 8.4.1). `Debug` shows no endpoint, payload or counterparty.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedList {
+    /// The endpoints [`Paykit::set_list_endpoints`] last set; `None` before the list is set.
+    pub endpoints: Option<BTreeMap<PaymentEndpointIdentifier, PaymentEndpointPayload>>,
+    /// The counterparties chosen by [`Paykit::publish_list_to`] and not withdrawn since, in
+    /// key order. Each is owed the current list until its publication applies.
+    pub recipients: Vec<[u8; 32]>,
+}
+
+impl std::fmt::Debug for SharedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedList")
+            .field("endpoints", &self.endpoints.as_ref().map(BTreeMap::len))
+            .field("recipients", &self.recipients.len())
+            .finish()
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListRecipient {
@@ -765,6 +785,31 @@ impl Paykit {
         self.local_put(key::LIST_SETTINGS, &ListSettings { endpoints })
             .await?;
         Box::pin(self.tend_private_lists(None)).await
+    }
+
+    /// The reusable list as last set, and the counterparties it is shared with, from this
+    /// app's state (Paykit spec 8.4.1): for display. It says nothing of delivery: a list
+    /// owed to a counterparty is sent by later calls and receives.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn shared_list(&self) -> Result<SharedList> {
+        let endpoints = match self.local_get::<ListSettings>(key::LIST_SETTINGS).await? {
+            Some(settings) => Some(settings.endpoints()?),
+            None => None,
+        };
+        let recipients = self
+            .local_scan::<ListRecipient>(key::LIST_RECIPIENTS)
+            .await?
+            .into_iter()
+            .filter(|(_, recipient)| recipient.chosen)
+            .map(|(_, recipient)| recipient.recipient)
+            .collect();
+        Ok(SharedList {
+            endpoints,
+            recipients,
+        })
     }
 
     /// Share the current reusable list with the counterparty the host chose. If
