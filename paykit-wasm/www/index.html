@@ -23,7 +23,7 @@
           const call = pending.get(data.id);
           pending.delete(data.id);
           if (data.ok) call?.resolve(data.value);
-          else call?.reject(new Error(data.error));
+          else call?.reject(Object.assign(new Error(data.error), { code: data.code, reason: data.reason }));
         };
         worker.onerror = (event) => {
           for (const call of pending.values()) call.reject(new Error(`worker error: ${event.message}`));

@@ -49,6 +49,7 @@ use zeroize::Zeroizing;
 use crate::error::EngineError;
 use crate::events::EventSink;
 use crate::feed::Observed;
+use crate::flights::Flights;
 use crate::homeserver::{JsHomeserver, SignerHomeserver};
 use crate::options::StartOptions;
 use crate::rail::JsRail;
@@ -109,6 +110,10 @@ pub struct Engine {
     pub store_names: [String; 2],
     /// When the signer's due work runs next, on the worker's wall clock in Unix ms.
     pub signer_due_at: Cell<f64>,
+    /// The host's `pay` calls in progress and their late answers.
+    pub flights: Flights,
+    /// A payment may be open: the feed loop resumes the payments at its next turn.
+    pub payments_open: Cell<bool>,
 }
 
 /// What an engine call works on.
@@ -171,8 +176,13 @@ impl Engine {
             homeserver: homeserver.clone(),
             homeserver_writer: Some(homeserver),
         };
-        let rail: Arc<dyn Rail> =
-            Arc::new(JsRail::new(options.endpoints.clone(), options.rail.clone()));
+        let flights = Flights::default();
+        let rail: Arc<dyn Rail> = Arc::new(JsRail::new(
+            options.endpoints.clone(),
+            options.rail.clone(),
+            options.pay_limit_ms,
+            flights.clone(),
+        ));
 
         let (paykit, signer, enrolment) = match record {
             Some(record) => {
@@ -229,6 +239,9 @@ impl Engine {
             homeserver: own_homeserver,
             store_names: [options.app_store_name(), options.signer_store_name()],
             signer_due_at: Cell::new(0.0),
+            flights,
+            // A start resumes whatever payment an earlier run left open.
+            payments_open: Cell::new(true),
         };
         Ok((engine, enrolment))
     }

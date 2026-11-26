@@ -40,7 +40,8 @@ const { identity, appId, enrolment } = await start({
   storePrefix: "paykit",                     // optional: stores <prefix>-app, <prefix>-signer
   clientId: "paykit-wasm",                   // optional
   homeserver: { get, put, delete },          // see below
-  rail: { endpoints: [{ identifier, fractionDigits }], pay, payment, verify },
+  rail: { endpoints: [{ identifier, fractionDigits }], pay, payment, verify,
+          payLimitMs: 60000 },               // optional: how long a payment waits for pay
   onEvent: (event) => postMessage({ kind: "event", event }), // optional
   autoReceive: true,                         // optional: the engine's own feed loop
 });
@@ -57,6 +58,15 @@ const { identity, appId, enrolment } = await start({
 | `contacts()` | `Promise<{allowed: Admission[], denied: string[]}>`, read from the Dispatch |
 | `requests()` | `Promise<OneTimeRequest[]>`: the requests held as payer, each with its `destination` |
 | `payeeActivity()` | `Promise<PayeeRequest[]>`: requests sent and payments received as payee |
+| `payments()` | `Promise<PaymentEntry[]>`: the payer's payments, each with its `stage` and, once it came, the payee's `receipt` |
+| `requestReceipts(id)` | `Promise<Receipt[]>`: the payee's receipts of one request |
+| `sendRequest(request: RequestInput)` | `Promise<SentRequest>`: payee: sign, record and send a Payment Request `{to, amount: {value, asset}, paymentReference, destination, proposalExpiresAtMs?, paymentDeadlineMs?}` |
+| `verifyPayment(record)` | `Promise<number \| null>`: payee: check the proof in an activity record with `rail.verify`; the paid time, or `null` |
+| `confirmPayment(record)` | `Promise<string \| null>`: payee: verify, then send the payer a receipt; its message ID (the same on a repeat), or `null` when not confirmed |
+| `cancelSentRequest(record, reason?)` | `Promise<string>`: payee: cancel a request sent |
+| `payRequest(id, options?)` | `Promise<PaymentOutcome>`: payer: pay a request through `rail.pay` and send the proof; `{outcome: "paid" \| "pending" \| ..., attemptId, proofMessageId?}` |
+| `rejectRequest(id, reason?)` | `Promise<string>`: payer: reject a request |
+| `resumePayments()` | `Promise<PaymentOutcome[]>`: finish the payments left open (the feed loop does it by itself) |
 | `receive()` | `Promise<ReceiveResult>`: one receive round now, with its events |
 | `signerTick()` | `Promise<{moreDue}>`: the signer's due work (renewals, key bundles) |
 | `stop()` | `Promise<void>`: ends the feed loop, closes the signer and the app, releases the stores |
@@ -84,16 +94,60 @@ included, runs after it.
 - `resetIdentity` leaves the identity's account at the Dispatch. Use it before enrolling the
   same identity again after a Dispatch database reset.
 
-Errors reject with an `Error` whose message is `<code>: <text>`. The codes are `bad_options`,
-`already_started`, `not_started`, `busy` (the engine is starting or stopping), `store`,
-`identity_mismatch`, `signer`, `enrolment`, `paykit`, `invalid_input` and `homeserver`.
+A request's ID is `{payee, requestHash}` as `requests()` gives it; a payee's `record` is the
+`record` of a `payeeActivity()` entry. A request's `destination` is
+`{type: "endpoints", endpoints: [{identifier, payload}]}` (endpoints the host made for it, such
+as a fresh address: `payload` `{"value":"<address>"}`), `{type: "any"}` (any of the identity's
+current endpoints) or `{type: "app", appId}`.
+
+Errors reject with an `Error` whose message is `<code>: <text>` and whose `code` property is the
+code: `bad_options`, `already_started`, `not_started`, `busy` (the engine is starting or
+stopping), `store`, `identity_mismatch`, `signer`, `enrolment`, `paykit`, `invalid_input`,
+`homeserver`, `refused`, `rail` and `conflict`. `refused` means a rule of Paykit refused the
+call, with nothing paid or sent; its `reason` property names the refusal (`alreadyPaid`,
+`paymentInProgress`, `rejected`, `cancelled`, `notFound`, `noDestination`, ...). `rail` means
+the host's method failed; `conflict` means the state changed meanwhile: read again and decide
+again. A payment that may have moved money is never an error: `payRequest` resolves `pending`
+or `uncertain`.
+
+### Payments
+
+The payer's side, as a wallet runs it:
+
+1. A request arrives: `requestReceived`, status `open`.
+2. `payRequest(request.id)`: the SDK writes the attempt, then calls `rail.pay` with the attempt
+   ID as the idempotency key. When `pay` answers paid, the proof goes to the payee and
+   `payRequest` resolves `paid` (`requestUpdated`, status `paid`).
+3. The payee confirms: `receiptReceived` with the receipt; `requests()` and `payments()` show it.
+
+The payee's side:
+
+1. `sendRequest(...)`, to an address the host made for it: `activityUpdated`, status
+   `requested`.
+2. The payer pays: `proofReceived` (status `proofReceived`).
+3. `confirmPayment(activity.record)` checks the proof with `rail.verify` and sends the receipt
+   (status `receipted`). `verifyPayment` alone checks without crediting.
+
+**Slow payments.** `pay` may take as long as the method needs, such as a payment out of a shared
+pool that waits for the pool's next round. `payRequest` waits up to `rail.payLimitMs` (default a
+minute). Past it, `pay` goes on by itself and `payRequest` resolves `pending`: the request shows
+`beingPaidHere`. While `pay` runs, the engine never hands the attempt to the host again and does
+not ask `rail.payment`. When `pay` answers, the engine finishes the payment by itself
+(`paymentsResumed`), sends the proof, and the receipt follows.
+
+**Restarts.** A start resumes the payments an earlier worker left open (`paymentsResumed`): an
+attempt whose `pay` was cut off by a terminated worker is finished from `rail.payment`, which
+must then answer from the host's own record of the attempt (`pending` while its payment runs,
+then `paid` with the proof). The feed loop resumes again at each of its turns while an outcome
+still waits on the method.
 
 ### Events
 
 `start`'s optional `onEvent(event)` is called with plain objects `{type, atMs, ...}`, in order.
 The feed loop runs a receive round whenever the Dispatch's feed has something (a long poll of up
 to 25 s between rounds, paced so it never spins), and the signer's due work once a minute. After
-each round the engine compares the requests and the payee activity with what it saw before:
+each round, and after each call that changes them, the engine compares the requests and the
+payee activity with what it saw before:
 
 | `type` | Fields | When |
 | --- | --- | --- |
@@ -105,6 +159,7 @@ each round the engine compares the requests and the payee activity with what it 
 | `receiptReceived` | `request`, `receipt` | the payee's receipt for a request arrived |
 | `proofReceived` | `activity` | a proof arrived for the payee to verify |
 | `activityUpdated` | `activity`, `previousStatus` | a sent request or received payment changed |
+| `paymentsResumed` | `outcomes` (`PaymentOutcome[]`) | the engine resumed payments left open (after a start, or a `pay` that answered after the limit) |
 | `error` | `during`, `code`, `message` | a step of the loop failed (told once while it keeps failing); the loop goes on |
 | `feedStopped` | `reason` | the feed loop ended |
 
@@ -128,8 +183,13 @@ pays an endpoint of a declared identifier whose payload is a JSON object with a 
 `value`. The transfer is the amount asked, and the settlement ID is the 32 bytes of the proof's
 `txid` (64 lowercase hex digits). The rest calls the host:
 
-- `pay(payment) -> Promise<RailOutcome>`, limited to 60 s, after which the attempt stays open.
-- `payment(attemptId) -> Promise<RailOutcome | null>`.
+- `pay(payment) -> Promise<RailOutcome>`: `payment` is `{attemptId, endpointId, payload,
+  amount: {value, asset}, paymentReference}`. It may take long (see Payments); the engine waits
+  `rail.payLimitMs` (default 60 s, 1 s to 1 h), and the call runs on to its end after that.
+  The engine never calls it twice at once for one attempt. A repeat with an attempt ID already
+  paid must return that payment, not pay again.
+- `payment(attemptId) -> Promise<RailOutcome | null>`: the host's record of an attempt:
+  `pending` while its payment runs, `null` only when `pay` was never called with it.
 - `verify(check) -> Promise<number | null>`: the verified payment time in Unix ms.
 
 `RailOutcome` is `{status: "paid", proof, paidAtMs?}`, `{status: "failed"}` or
@@ -147,17 +207,26 @@ pays an endpoint of a declared identifier whose payload is a JSON object with a 
   (`GET`/`PUT`/`DELETE /{identityZ32}{path}`); every engine event streamed to Node; native peers
   (`paykit-peer ... run`) driven over stdin and stdout. `waitFor(match)` on an engine or a peer
   resolves on the first matching event, seen or to come, so scenarios wait on events, never on
-  sleeps. Later scenarios import it.
+  sleeps. `RegtestRail` is a test payment method in Node on bitcoind regtest, with a bitcoind
+  wallet of its own: `pay` sends with `sendtoaddress`, `verify` reads the transaction index, and
+  `behaviour` makes a payment slow (`delayMs` before sending, `holdMs` after). Workers reach it
+  over the page server (start option `railUrl`, made by `harness.openRail(name)`). Later
+  scenarios import it.
 - `smoke.mjs`: the scenarios `start` (enrol, reload, refuse another identity on the same
   stores) and `peer` (allow both ways with a native peer, a request from the peer received as
   typed events, a worker terminated without `stop` and restarted on the same stores, the feed
-  going on after it, `signerTick`, `stop`, `resetIdentity`).
+  going on after it, `signerTick`, `stop`, `resetIdentity`), and `flow` (on regtest with a
+  native peer that pays and confirms by itself: the browser engine pays a request with a 20 s
+  method and gets the receipt; it requests to a fresh address, verifies the peer's payment
+  on-chain and confirms it; a worker terminated mid-payment restarts, resumes the payment and
+  gets the receipt; a payment past a 3 s pay limit resolves `pending` and is finished when the
+  method answers; a rejection and a cancellation; every transaction checked in bitcoind).
 
 Playwright comes from `paykit-browser/rig`:
 
 ```sh
 (cd paykit-browser/rig && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci)
-node paykit-wasm/www/smoke.mjs --pkg <pkg folder> [--scenario start|peer|all]
+node paykit-wasm/www/smoke.mjs --pkg <pkg folder> [--scenario start|peer|flow|all]
 ```
 
 The script reads these environment variables:
@@ -172,6 +241,6 @@ The script reads these environment variables:
 - `PAYKIT_WASM_BITCOIND`, `PAYKIT_WASM_RPC_USER`, `PAYKIT_WASM_RPC_PASSWORD` (the peers'
   bitcoind; default `http://127.0.0.1:18443`, `admin1`, `123`)
 
-Each run enrols new random identities on the Dispatch, which keeps them. The `peer` scenario
-needs bitcoind for the peer's receive addresses; the harness unloads the peer's bitcoind wallet
-at the end.
+Each run enrols new random identities on the Dispatch, which keeps them. The `peer` and `flow`
+scenarios need bitcoind; `flow` funds its wallets from bitcoind's `default` wallet and mines a
+block. The harness unloads the peers' and the rails' bitcoind wallets at the end.

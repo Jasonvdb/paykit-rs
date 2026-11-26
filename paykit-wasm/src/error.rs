@@ -3,16 +3,27 @@
 //! The text names the step that failed and, for an error from the SDK, the signer or the
 //! store, that error's own text. It never holds a secret: the identity secret is only ever
 //! read into the vault, and no error quotes a start option's value.
+//!
+//! The `Error` also carries the code as its `code` property, and, for a call a rule of Paykit
+//! refused (code `refused`), the refusal's name as `reason`, such as `alreadyPaid`, `notFound`
+//! or `paymentInProgress` (paykit-sdk's `Refusal` cases in lowerCamelCase), so a host can
+//! branch on it without reading the text.
 
 use std::fmt;
 
-use wasm_bindgen::JsError;
+use js_sys::{Error as JsErrorObject, Reflect};
+use paykit_sdk::{PaykitError, Refusal};
+use wasm_bindgen::JsValue;
+
+use crate::views::case_name;
 
 /// A failed engine call.
 #[derive(Debug)]
 pub struct EngineError {
     code: &'static str,
     text: String,
+    /// The refusal's case name, for code `refused`.
+    reason: Option<String>,
 }
 
 impl EngineError {
@@ -20,6 +31,37 @@ impl EngineError {
         Self {
             code,
             text: text.into(),
+            reason: None,
+        }
+    }
+
+    /// The SDK's `error` at `step`, by its kind:
+    ///
+    /// - `refused`: a rule of Paykit refused the call, such as a request already paid or a
+    ///   record without a proof; `reason` names the refusal;
+    /// - `rail`: the host's payment method failed (`pay`, `payment` or `verify`);
+    /// - `conflict`: what the call was built on changed meanwhile; read again and decide again;
+    /// - `invalid_input`: an argument fails one of Paykit's structural checks;
+    /// - `homeserver`: a Homeserver could not be read now;
+    /// - `paykit`: any other failure of the SDK or the Dispatch client.
+    pub fn sdk(step: &str, error: &PaykitError) -> Self {
+        let text = format!("{step}: {error}");
+        match error {
+            PaykitError::Refused(refusal) => Self::refused(step, refusal),
+            PaykitError::Rail(_) => Self::new("rail", text),
+            PaykitError::Conflict(_) => Self::new("conflict", text),
+            PaykitError::Lib(paykit_lib::Error::Validation(_)) => Self::new("invalid_input", text),
+            PaykitError::Homeserver(_) => Self::new("homeserver", text),
+            _ => Self::new("paykit", text),
+        }
+    }
+
+    /// `refused`: a rule of Paykit refused the call at `step`.
+    pub fn refused(step: &str, refusal: &Refusal) -> Self {
+        Self {
+            code: "refused",
+            text: format!("{step}: {refusal}"),
+            reason: Some(case_name(refusal)),
         }
     }
 
@@ -96,6 +138,11 @@ impl EngineError {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// The refusal's case name, for code `refused`.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
 }
 
 impl fmt::Display for EngineError {
@@ -104,8 +151,15 @@ impl fmt::Display for EngineError {
     }
 }
 
-impl From<EngineError> for JsError {
+/// An `Error` whose message is `<code>: <text>`, with the properties `code` and, for a
+/// refusal, `reason`.
+impl From<EngineError> for JsValue {
     fn from(error: EngineError) -> Self {
-        JsError::new(&error.to_string())
+        let object = JsErrorObject::new(&error.to_string());
+        let _ = Reflect::set(&object, &"code".into(), &error.code.into());
+        if let Some(reason) = &error.reason {
+            let _ = Reflect::set(&object, &"reason".into(), &reason.as_str().into());
+        }
+        object.into()
     }
 }

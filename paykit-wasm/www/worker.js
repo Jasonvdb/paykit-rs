@@ -8,7 +8,9 @@
 // Homeserver with the fake Homeserver's API (GET/PUT/DELETE /{identityZ32}{path}), and
 // `ownIdentity`, the engine's Pubky ID. The worker then builds the Homeserver callbacks on
 // fetch against it, for that identity, and drops both keys from the options. "start" also
-// gets an `onEvent` callback that forwards each event to the page.
+// gets an `onEvent` callback that forwards each event to the page, and, for `railUrl`, the
+// path of a test payment method on the page's server (`RegtestRail` in harness.mjs), the
+// rail callbacks `pay`, `payment` and `verify` as fetch calls to it.
 
 import init, * as engine from "./pkg/paykit_wasm.js";
 
@@ -34,13 +36,31 @@ function fetchHomeserver(base, own) {
   };
 }
 
+function fetchRail(path) {
+  const call = async (op, argument) => {
+    const answer = await fetch(new URL(`${path}/${op}`, self.location), {
+      method: "POST",
+      body: JSON.stringify(argument),
+    });
+    if (!answer.ok) throw new Error(`rail ${op} answered ${answer.status}: ${await answer.text()}`);
+    return await answer.json();
+  };
+  return {
+    pay: (payment) => call("pay", payment),
+    payment: (attemptId) => call("payment", attemptId),
+    verify: (check) => call("verify", check),
+  };
+}
+
 // The options with the harness's keys replaced by the callbacks they describe.
 function withHomeserver(options) {
   if (!options || options.homeserverUrl === undefined) return options;
-  const { homeserverUrl, ownIdentity, ...rest } = options;
+  const { homeserverUrl, ownIdentity, railUrl, ...rest } = options;
   // The engine's identity is known only once it starts, and the signer writes during the
   // start: the caller passes it, as a host that derives it from the same key would.
-  return { ...rest, homeserver: fetchHomeserver(homeserverUrl, ownIdentity) };
+  const withCallbacks = { ...rest, homeserver: fetchHomeserver(homeserverUrl, ownIdentity) };
+  if (railUrl !== undefined) withCallbacks.rail = { ...rest.rail, ...fetchRail(railUrl) };
+  return withCallbacks;
 }
 
 async function run(op, args) {
@@ -64,6 +84,13 @@ self.onmessage = async (message) => {
     const value = await run(op, args ?? []);
     self.postMessage({ kind: "result", id, ok: true, value: value ?? null });
   } catch (error) {
-    self.postMessage({ kind: "result", id, ok: false, error: String(error?.message ?? error) });
+    self.postMessage({
+      kind: "result",
+      id,
+      ok: false,
+      error: String(error?.message ?? error),
+      code: error?.code ?? null,
+      reason: error?.reason ?? null,
+    });
   }
 };
