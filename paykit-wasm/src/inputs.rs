@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use js_sys::JSON;
 use paykit_sdk::{
     Asset, Decimal, PayOptions, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
-    PaymentReference, RequestDestination, RequestDraft, RequestRef,
+    PaymentMode, PaymentReference, RequestDestination, RequestDraft, RequestRef, UserConfirmed,
 };
 use pubky_dispatch_core::enc::unb64_array;
 use serde::de::DeserializeOwned;
@@ -115,30 +115,45 @@ enum PlainDestination {
     Any,
 }
 
+/// The endpoints `plain`, each validated, no identifier twice; `what` names them in errors.
+fn endpoint_map(
+    plain: Vec<PlainEndpoint>,
+    what: &str,
+) -> Result<BTreeMap<PaymentEndpointIdentifier, PaymentEndpointPayload>, EngineError> {
+    let mut values = BTreeMap::new();
+    for endpoint in plain {
+        let identifier = PaymentEndpointIdentifier::new(&endpoint.identifier).map_err(|_| {
+            EngineError::invalid_input(format!(
+                "{what} holds an invalid Payment Endpoint Identifier"
+            ))
+        })?;
+        let payload = PaymentEndpointPayload::new(&endpoint.payload)
+            .map_err(|_| EngineError::invalid_input(format!("{what} holds an invalid payload")))?;
+        if values.insert(identifier, payload).is_some() {
+            return Err(EngineError::invalid_input(format!(
+                "{what} names an identifier twice"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+/// Reads `setListEndpoints`' argument: `[{identifier, payload}]`, possibly empty (an empty
+/// list withdraws the details from every contact it is shared with).
+pub fn list_endpoints(
+    value: &JsValue,
+) -> Result<BTreeMap<PaymentEndpointIdentifier, PaymentEndpointPayload>, EngineError> {
+    let plain: Vec<PlainEndpoint> = read(value, "the list's endpoints")?;
+    endpoint_map(plain, "the list's endpoints")
+}
+
 fn destination(plain: PlainDestination) -> Result<RequestDestination, EngineError> {
     Ok(match plain {
         PlainDestination::Endpoints { endpoints } => {
             if endpoints.is_empty() {
                 return Err(EngineError::invalid_input("destination.endpoints is empty"));
             }
-            let mut values = BTreeMap::new();
-            for endpoint in endpoints {
-                let identifier =
-                    PaymentEndpointIdentifier::new(&endpoint.identifier).map_err(|_| {
-                        EngineError::invalid_input(
-                            "destination.endpoints holds an invalid Payment Endpoint Identifier",
-                        )
-                    })?;
-                let payload = PaymentEndpointPayload::new(&endpoint.payload).map_err(|_| {
-                    EngineError::invalid_input("destination.endpoints holds an invalid payload")
-                })?;
-                if values.insert(identifier, payload).is_some() {
-                    return Err(EngineError::invalid_input(
-                        "destination.endpoints names an identifier twice",
-                    ));
-                }
-            }
-            RequestDestination::Endpoints(values)
+            RequestDestination::Endpoints(endpoint_map(endpoints, "destination.endpoints")?)
         }
         PlainDestination::App { app_id } => RequestDestination::RequiredApp(
             unb64_array::<16>(&app_id)
@@ -204,21 +219,51 @@ pub fn request_input(value: &JsValue) -> Result<RequestInput, EngineError> {
     })
 }
 
-/// Reads `payRequest`'s options: `undefined`, or `{endpoint?}`, the Payment Endpoint
-/// Identifier to pay; the first usable one otherwise.
+/// Where a payment to a request without its own endpoints goes (`PayRequestOptions.mode`).
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PlainMode {
+    /// An endpoint of one of the payee's Private Payment Lists.
+    #[default]
+    Private,
+    /// The payee's public endpoints, which the user chose.
+    Public,
+}
+
+/// Reads `payRequest`'s options: `undefined`, or `{endpoint?, listApp?, mode?}`: the Payment
+/// Endpoint Identifier to pay (the first usable one otherwise); for a request whose
+/// destination is not its own endpoints, the payee app whose Private Payment List to pay
+/// (any current one otherwise), and `"private"` (the default) or `"public"`, the user's
+/// choice of the payee's public endpoints.
 pub fn pay_options(value: &JsValue) -> Result<PayOptions, EngineError> {
     #[derive(Default, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Plain {
         #[serde(default)]
         endpoint: Option<String>,
+        #[serde(default)]
+        list_app: Option<String>,
+        #[serde(default)]
+        mode: PlainMode,
     }
     let plain: Option<Plain> = read(value, "the payment options")?;
+    let plain = plain.unwrap_or_default();
     let mut options = PayOptions::default();
-    if let Some(endpoint) = plain.unwrap_or_default().endpoint {
-        options.endpoint = Some(PaymentEndpointIdentifier::new(&endpoint).map_err(|_| {
-            EngineError::invalid_input("endpoint is not a Payment Endpoint Identifier")
-        })?);
+    if let Some(endpoint) = plain.endpoint {
+        options =
+            options.with_endpoint(PaymentEndpointIdentifier::new(&endpoint).map_err(|_| {
+                EngineError::invalid_input("endpoint is not a Payment Endpoint Identifier")
+            })?);
+    }
+    if let Some(app) = plain.list_app {
+        options = options.with_list_app(
+            unb64_array::<16>(&app)
+                .map_err(|_| EngineError::invalid_input("listApp is not an App ID"))?,
+        );
+    }
+    if let PlainMode::Public = plain.mode {
+        // The host calls with `public` only on the user's choice (Paykit spec 8.1).
+        options = options.with_mode(PaymentMode::Public(UserConfirmed::new()));
     }
     Ok(options)
 }

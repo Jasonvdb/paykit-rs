@@ -29,7 +29,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use js_sys::Date;
-use paykit_sdk::{PayeeStatus, RequestView};
+use paykit_sdk::{ListVersion, PayeeStatus, ReceivedList, RequestView};
 use pubky_dispatch_client::app::{AppEvent, WaitPace, Woken, MAX_WAIT_SECONDS};
 use pubky_dispatch_core::enc::pubky_id;
 use serde_json::{json, Value};
@@ -65,6 +65,10 @@ pub struct Observed {
     activity: HashMap<[u8; 32], String>,
     /// Each contact's admission.
     admissions: HashMap<[u8; 32], Admission>,
+    /// The version of each Private Payment List held, by payee and publishing app.
+    lists: HashMap<([u8; 32], [u8; 16]), ListVersion>,
+    /// The list this identity shares, as last told.
+    shared: Option<Value>,
     /// The last error told for each step, so a step that keeps failing the same way is told
     /// once.
     errors: HashMap<&'static str, String>,
@@ -223,6 +227,17 @@ pub async fn baseline(engine: &Rc<Engine>) {
                 .insert(sale.record, views::case_name(&sale.status));
         }
     }
+    if let Ok(shared) = Box::pin(turn.paykit.shared_list()).await {
+        engine.observed.borrow_mut().shared = Some(views::shared_list(&shared));
+    }
+    if let Ok(lists) = Box::pin(turn.paykit.received_lists()).await {
+        let mut observed = engine.observed.borrow_mut();
+        for list in &lists {
+            observed
+                .lists
+                .insert((list.payee, list.app_id), list.version);
+        }
+    }
     if let Ok(list) = Box::pin(turn.paykit.app_mut().allow_list()).await {
         let mut observed = engine.observed.borrow_mut();
         for peer in &list.peers {
@@ -323,6 +338,60 @@ pub async fn observe(engine: &Engine, turn: &Turn) {
             Err(EngineError::sdk("read the payee activity", &error)),
         ),
     }
+    match Box::pin(turn.paykit.received_lists()).await {
+        Ok(lists) => {
+            report(engine, "receivedLists", Ok(()));
+            for list in &lists {
+                observe_list(engine, list);
+            }
+        }
+        Err(error) => report(
+            engine,
+            "receivedLists",
+            Err(EngineError::sdk("read the received lists", &error)),
+        ),
+    }
+}
+
+/// Emits `listReceived` for a Private Payment List not seen before, or of a new version: a
+/// contact shared, changed or withdrew its payment details.
+fn observe_list(engine: &Engine, list: &ReceivedList) {
+    let previous = engine
+        .observed
+        .borrow_mut()
+        .lists
+        .insert((list.payee, list.app_id), list.version);
+    if previous == Some(list.version) {
+        return;
+    }
+    engine.events.emit(
+        "listReceived",
+        json!({
+            "list": views::received_list(list, now_ms()),
+            "previousVersion": previous.map(views::list_version),
+        }),
+    );
+}
+
+/// Reads the list this identity shares (`SharedList` in the declarations) and emits
+/// `sharedListUpdated` when it differs from what was last told.
+pub async fn observe_shared(engine: &Engine, turn: &Turn) -> Result<Value, EngineError> {
+    let shared = Box::pin(turn.paykit.shared_list())
+        .await
+        .map_err(|error| EngineError::sdk("read the shared list", &error))?;
+    let view = views::shared_list(&shared);
+    let previous = engine.observed.borrow_mut().shared.replace(view.clone());
+    if previous.as_ref() != Some(&view) {
+        engine
+            .events
+            .emit("sharedListUpdated", json!({ "list": view.clone() }));
+    }
+    Ok(view)
+}
+
+/// The worker's clock in Unix ms.
+pub fn now_ms() -> u64 {
+    Date::now().max(0.0) as u64
 }
 
 fn observe_request(engine: &Engine, view: &RequestView) {

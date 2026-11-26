@@ -13,9 +13,12 @@
 
 use std::fmt::Debug;
 
+use std::collections::BTreeMap;
+
 use paykit_sdk::{
-    PayOutcome, PayeeActivity, PaymentAmount, PaymentView, ReceivedReceipt, RequestDestination,
-    RequestView, SentRequest,
+    ListVersion, PayOutcome, PayeeActivity, PaymentAmount, PaymentEndpointIdentifier,
+    PaymentEndpointPayload, PaymentView, ReceivedList, ReceivedReceipt, RequestDestination,
+    RequestView, SentRequest, SharedList,
 };
 use pubky_dispatch_core::enc::{b64, pubky_id, pubky_key};
 use serde_json::{json, Value};
@@ -63,20 +66,53 @@ pub fn amount(amount: &PaymentAmount) -> Value {
     json!({ "value": amount.value.as_str(), "asset": amount.asset.as_str() })
 }
 
+/// Endpoints as `[{identifier, payload}]`, in identifier order.
+pub fn endpoints(endpoints: &BTreeMap<PaymentEndpointIdentifier, PaymentEndpointPayload>) -> Value {
+    endpoints
+        .iter()
+        .map(|(identifier, payload)| {
+            json!({ "identifier": identifier.as_str(), "payload": payload.as_str() })
+        })
+        .collect()
+}
+
+/// A Private Payment List's version: `{generation, counter}`.
+pub fn list_version(version: ListVersion) -> Value {
+    json!({ "generation": version.generation(), "counter": version.counter() })
+}
+
+/// A Private Payment List a contact shared with this identity (`ReceivedList`): `{payee,
+/// appId, version, endpoints, acceptedAtMs, usableUntilMs, usable}`. `usable` is whether a
+/// payment may use it now, as far as this app knows: it has endpoints and has not expired.
+pub fn received_list(list: &ReceivedList, now_ms: u64) -> Value {
+    json!({
+        "payee": pubky_id(&list.payee),
+        "appId": b64(&list.app_id),
+        "version": list_version(list.version),
+        "endpoints": endpoints(&list.endpoints),
+        "acceptedAtMs": list.accepted_at_ms,
+        "usableUntilMs": list.usable_until_ms,
+        "usable": !list.endpoints.is_empty() && now_ms < list.usable_until_ms,
+    })
+}
+
+/// The list this identity shares (`SharedList`): `{endpoints, recipients}`, `endpoints`
+/// `null` before `setListEndpoints`.
+pub fn shared_list(list: &SharedList) -> Value {
+    json!({
+        "endpoints": list.endpoints.as_ref().map(endpoints),
+        "recipients": list.recipients.iter().map(pubky_id).collect::<Vec<_>>(),
+    })
+}
+
 /// A request's destination: `{type: "endpoints", endpoints: [{identifier, payload}]}`,
 /// `{type: "app", appId}` or `{type: "any"}`. A payload is the endpoint's text as signed,
 /// such as `{"value":"<address>"}`.
 pub fn destination(destination: &RequestDestination) -> Value {
     match destination {
-        RequestDestination::Endpoints(endpoints) => json!({
+        RequestDestination::Endpoints(list) => json!({
             "type": "endpoints",
-            "endpoints": endpoints
-                .iter()
-                .map(|(identifier, payload)| json!({
-                    "identifier": identifier.as_str(),
-                    "payload": payload.as_str(),
-                }))
-                .collect::<Vec<_>>(),
+            "endpoints": endpoints(list),
         }),
         RequestDestination::RequiredApp(app) => json!({ "type": "app", "appId": b64(app) }),
         RequestDestination::Any => json!({ "type": "any" }),
