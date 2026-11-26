@@ -19,7 +19,7 @@ use paykit_lib::derive::natural_key;
 use paykit_lib::kinds::{check_sender_for_request, may_send, Kind, Side};
 use paykit_lib::records::{ActivityRecord, ActivitySide, PaymentListRecord, StoredMessage};
 use paykit_lib::scopes::CertificateMemo;
-use paykit_lib::Label;
+use paykit_lib::{Body, Label, ListVersion, PaymentEndpointIdentifier, PaymentEndpointPayload};
 use pubky_dispatch_client::app::{
     LocalWrite, OpBatch, OutgoingMessage, ReceivedMessage, RecordTarget, SharedRecord,
     SignedMessage,
@@ -31,11 +31,42 @@ use pubky_dispatch_core::ops::{Condition, OpKind, RecordVersion};
 use pubky_dispatch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 use crate::activity::{self, ActivityTarget, Role, SideTag};
 use crate::error::{PaykitError, Refusal, Result};
 use crate::paykit::Paykit;
 use crate::receive::Settlement;
+
+/// A Private Payment List the app holds from a payee app ([`Paykit::received_lists`];
+/// Paykit spec 8.4, wire 4.13). `Debug` shows no endpoint or payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceivedList {
+    /// The payee who shared it.
+    pub payee: [u8; 32],
+    /// The payee app that published it.
+    pub app_id: [u8; 16],
+    /// Its version (Paykit wire 4.13).
+    pub version: ListVersion,
+    /// Its endpoints: empty once the payee withdrew the list.
+    pub endpoints: BTreeMap<PaymentEndpointIdentifier, PaymentEndpointPayload>,
+    /// When this identity's inbox accepted it, in Unix ms, when known.
+    pub accepted_at_ms: Option<u64>,
+    /// The instant from which a payment no longer uses it, in Unix ms: the earlier of its
+    /// `expires_at` and 30 days after its acceptance (Paykit spec 5).
+    pub usable_until_ms: u64,
+}
+
+impl std::fmt::Debug for ReceivedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceivedList")
+            .field("version", &self.version)
+            .field("endpoints", &self.endpoints.len())
+            .field("accepted_at_ms", &self.accepted_at_ms)
+            .field("usable_until_ms", &self.usable_until_ms)
+            .finish_non_exhaustive()
+    }
+}
 
 /// The pending write prepared from an inbox proposal while its signed withdrawal was already held.
 #[derive(Clone, Serialize, Deserialize)]
@@ -635,6 +666,50 @@ impl Paykit {
                 continue;
             }
             out.push((list, record.version));
+        }
+        Ok(out)
+    }
+
+    /// The Private Payment Lists this app holds from its counterparties, one per payee app,
+    /// in record order (Paykit spec 8.4, wire 5.4): for display, such as a contact's shared
+    /// payment details. Only a list the gate admits (`list_key_open`) and whose record
+    /// binds. A withdrawn list has no endpoints. A payment judges each list again before it
+    /// pays (Paykit spec 7.2): an expired list, or one from an app the payee has since
+    /// removed, may be shown here and still refused.
+    ///
+    /// # Errors
+    ///
+    /// A store or client failure.
+    pub async fn received_lists(&self) -> Result<Vec<ReceivedList>> {
+        let own = self.identity();
+        let mut out = Vec::new();
+        for record in self.app.records_of(Collection::PaymentLists.name()).await? {
+            let Some(value) = record.content.value() else {
+                continue;
+            };
+            let Some(list) = bind_list(value, &own, &record.key, |t| self.app.record_key(t).ok())
+            else {
+                continue;
+            };
+            if !list_key_open(self.list_record_lost(&record.key).await?.as_ref()) {
+                continue;
+            }
+            let Body::PrivatePaymentList(body) = list.list.body() else {
+                continue;
+            };
+            let accepted_at_ms = list.list.accepted_at();
+            out.push(ReceivedList {
+                payee: list.payee,
+                app_id: list.app_id,
+                version: body.version,
+                endpoints: body
+                    .payment_endpoints
+                    .iter()
+                    .map(|(id, endpoint)| (id.clone(), endpoint.payload.clone()))
+                    .collect(),
+                accepted_at_ms,
+                usable_until_ms: body.usable_until(accepted_at_ms.unwrap_or(0)),
+            });
         }
         Ok(out)
     }

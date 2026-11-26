@@ -23,7 +23,7 @@ The script builds `-p paykit-wasm` for `wasm32-unknown-unknown` with `--locked`,
 `paykit_wasm.d.ts` and `paykit_wasm_bg.wasm.d.ts`. Build with `-p paykit-wasm`, never
 `--workspace`, for wasm32.
 
-The `browser-release` module is about 7.5 MB.
+The `browser-release` module is about 8.2 MB.
 
 ## Use
 
@@ -47,7 +47,9 @@ const { identity, appId, enrolment } = await start({
 });
 ```
 
-`paykit_wasm.d.ts` declares every type. In short:
+`paykit_wasm.d.ts` declares every type, and `API.md` is the full reference for a host: every
+call, record and event, the callback contracts, threading and restart rules, and a usage
+example. In short:
 
 | Call | Result |
 | --- | --- |
@@ -67,6 +69,11 @@ const { identity, appId, enrolment } = await start({
 | `payRequest(id, options?)` | `Promise<PaymentOutcome>`: payer: pay a request through `rail.pay` and send the proof; `{outcome: "paid" \| "pending" \| ..., attemptId, proofMessageId?}` |
 | `rejectRequest(id, reason?)` | `Promise<string>`: payer: reject a request |
 | `resumePayments()` | `Promise<PaymentOutcome[]>`: finish the payments left open (the feed loop does it by itself) |
+| `setListEndpoints(endpoints)` | `Promise<void>`: set the reusable Private Payment List this identity shares, `[{identifier, payload}]` |
+| `publishListTo(identity)` | `Promise<void>`: share it with a contact |
+| `withdrawListFrom(identity)` | `Promise<void>`: stop sharing it with a contact |
+| `sharedList()` | `Promise<{endpoints, recipients}>`: the list shared and with whom |
+| `receivedLists()` | `Promise<ReceivedList[]>`: the lists contacts shared with this identity |
 | `receive()` | `Promise<ReceiveResult>`: one receive round now, with its events |
 | `signerTick()` | `Promise<{moreDue}>`: the signer's due work (renewals, key bundles) |
 | `stop()` | `Promise<void>`: ends the feed loop, closes the signer and the app, releases the stores |
@@ -97,8 +104,8 @@ included, runs after it.
 A request's ID is `{payee, requestHash}` as `requests()` gives it; a payee's `record` is the
 `record` of a `payeeActivity()` entry. A request's `destination` is
 `{type: "endpoints", endpoints: [{identifier, payload}]}` (endpoints the host made for it, such
-as a fresh address: `payload` `{"value":"<address>"}`), `{type: "any"}` (any of the identity's
-current endpoints) or `{type: "app", appId}`.
+as a fresh address: `payload` `{"value":"<address>"}`), `{type: "any"}` (any of the payee's
+current Private Payment Lists or public endpoints) or `{type: "app", appId}`.
 
 Errors reject with an `Error` whose message is `<code>: <text>` and whose `code` property is the
 code: `bad_options`, `already_started`, `not_started`, `busy` (the engine is starting or
@@ -141,6 +148,28 @@ must then answer from the host's own record of the attempt (`pending` while its 
 then `paid` with the proof). The feed loop resumes again at each of its turns while an outcome
 still waits on the method.
 
+### Private Payment Lists
+
+A Private Payment List is reusable payment details one identity shares with chosen contacts,
+signed and sent to each contact's inbox. A request with destination `{type: "any"}` is paid to
+one of them, so the payee sends no address with the request.
+
+- `setListEndpoints([{identifier: "btc-regtest-p2tr", payload: "{\"value\":\"<address>\"}"}])`
+  sets the list. Each contact it is shared with is sent the changed list; an empty list
+  withdraws the details from all of them.
+- `publishListTo(contact)` shares it (the contact must admit this identity);
+  `withdrawListFrom(contact)` stops. `sharedList()` reads `{endpoints, recipients}`, and
+  `sharedListUpdated` tells each change.
+- A list a contact shared arrives as `listReceived` and is read with `receivedLists()`:
+  `{payee, appId, version, endpoints, acceptedAtMs, usableUntilMs, usable}`, the latest from
+  each of the contact's apps. A withdrawn list has no endpoints.
+- Paying a request with destination `any`: `payRequest(id)` pays an endpoint of the payee's
+  lists (`options.listApp` picks the app, `options.endpoint` the identifier). With no list yet
+  it is `refused` `waitingForList`, and the engine asks the payee for one.
+- Being paid on one: the proof's `rail.verify` check has `payload: null`, as the payee signed
+  no address for the request. The method checks the payment against its own endpoints for
+  `endpointId`, such as the addresses it put in its list.
+
 ### Events
 
 `start`'s optional `onEvent(event)` is called with plain objects `{type, atMs, ...}`, in order.
@@ -160,11 +189,14 @@ payee activity with what it saw before:
 | `proofReceived` | `activity` | a proof arrived for the payee to verify |
 | `activityUpdated` | `activity`, `previousStatus` | a sent request or received payment changed |
 | `paymentsResumed` | `outcomes` (`PaymentOutcome[]`) | the engine resumed payments left open (after a start, or a `pay` that answered after the limit) |
+| `listReceived` | `list` (`ReceivedList`), `previousVersion` | a contact shared, changed or withdrew its Private Payment List |
+| `sharedListUpdated` | `list` (`SharedList`) | the list this identity shares, or its recipients, changed |
 | `error` | `during`, `code`, `message` | a step of the loop failed (told once while it keeps failing); the loop goes on |
 | `feedStopped` | `reason` | the feed loop ended |
 
-The comparison starts from the state at `start`: read `requests()` and `payeeActivity()` once
-after `start`, then follow the events. A request already held at start is not told again.
+The comparison starts from the state at `start`: read `requests()`, `payeeActivity()`,
+`receivedLists()` and `sharedList()` once after `start`, then follow the events. Anything
+already held at start is not told again.
 
 ### Homeserver callbacks
 
@@ -190,7 +222,9 @@ pays an endpoint of a declared identifier whose payload is a JSON object with a 
   paid must return that payment, not pay again.
 - `payment(attemptId) -> Promise<RailOutcome | null>`: the host's record of an attempt:
   `pending` while its payment runs, `null` only when `pay` was never called with it.
-- `verify(check) -> Promise<number | null>`: the verified payment time in Unix ms.
+- `verify(check) -> Promise<number | null>`: the verified payment time in Unix ms. `check` is
+  `{endpointId, payload, amount, attemptId, proof}`; `payload` is `null` for a request with
+  destination `any` or `app` (see Private Payment Lists).
 
 `RailOutcome` is `{status: "paid", proof, paidAtMs?}`, `{status: "failed"}` or
 `{status: "pending"}`. Each callback is optional. Without `pay` a payment is refused, and without
@@ -220,13 +254,17 @@ pays an endpoint of a declared identifier whose payload is a JSON object with a 
   method and gets the receipt; it requests to a fresh address, verifies the peer's payment
   on-chain and confirms it; a worker terminated mid-payment restarts, resumes the payment and
   gets the receipt; a payment past a 3 s pay limit resolves `pending` and is finished when the
-  method answers; a rejection and a cancellation; every transaction checked in bitcoind).
+  method answers; a rejection and a cancellation; every transaction checked in bitcoind), and
+  `list` (Private Payment Lists both ways with a native peer, requests with destination `any`
+  both ways paid to the list addresses, a restart that keeps both lists, a withdrawal).
+  `RegtestRail.listAddress()` makes an address for the engine's list, which `verify` checks
+  when a proof has no payload.
 
 Playwright comes from `paykit-browser/rig`:
 
 ```sh
 (cd paykit-browser/rig && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci)
-node paykit-wasm/www/smoke.mjs --pkg <pkg folder> [--scenario start|peer|flow|all]
+node paykit-wasm/www/smoke.mjs --pkg <pkg folder> [--scenario start|peer|flow|list|all]
 ```
 
 The script reads these environment variables:
@@ -241,6 +279,6 @@ The script reads these environment variables:
 - `PAYKIT_WASM_BITCOIND`, `PAYKIT_WASM_RPC_USER`, `PAYKIT_WASM_RPC_PASSWORD` (the peers'
   bitcoind; default `http://127.0.0.1:18443`, `admin1`, `123`)
 
-Each run enrols new random identities on the Dispatch, which keeps them. The `peer` and `flow`
-scenarios need bitcoind; `flow` funds its wallets from bitcoind's `default` wallet and mines a
+Each run enrols new random identities on the Dispatch, which keeps them. The `peer`, `flow` and
+`list` scenarios need bitcoind; `flow` and `list` fund its wallets from bitcoind's `default` wallet and mines a
 block. The harness unloads the peers' and the rails' bitcoind wallets at the end.

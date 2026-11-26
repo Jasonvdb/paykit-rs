@@ -320,11 +320,21 @@ export class RegtestRail {
     this.attempts = new Map();
     /** [{op, attemptId, atMs}] */
     this.calls = [];
+    /** The addresses the engine shares in its Private Payment List (`listAddress`). */
+    this.listed = new Set();
   }
 
   /** A new address of the rail's wallet: `bech32m` (P2TR) or `bech32` (P2WPKH). */
   async newAddress(type = "bech32m") {
     return bitcoindCall("getnewaddress", ["", type], this.wallet);
+  }
+
+  /** A new address for the engine's Private Payment List. `verify` checks a payment whose
+   * proof names no payload (a request with destination any or app) against these. */
+  async listAddress(type = "bech32m") {
+    const address = await this.newAddress(type);
+    this.listed.add(address);
+    return address;
   }
 
   async pay({ attemptId, endpointId, payload, amount }) {
@@ -364,15 +374,18 @@ export class RegtestRail {
 
   async verify({ payload, amount, proof }) {
     this.calls.push({ op: "verify", attemptId: null, atMs: Date.now() });
-    const address = JSON.parse(payload ?? "{}").value;
-    if (!address || amount.asset !== "btc" || !/^[0-9a-f]{64}$/.test(proof?.txid ?? "")) return null;
-    let found;
+    // A payment to a request with destination any or app comes with no payload: the payee
+    // signed no address for it, so the method checks its own list addresses.
+    const addresses = payload == null ? [...this.listed] : [JSON.parse(payload).value];
+    if (!addresses.every(Boolean) || addresses.length === 0) return null;
+    if (amount.asset !== "btc" || !/^[0-9a-f]{64}$/.test(proof?.txid ?? "")) return null;
+    let sats = 0n;
     try {
-      found = await paidTo(proof.txid, address);
+      for (const address of addresses) sats += (await paidTo(proof.txid, address)).sats;
     } catch {
       return null;
     }
-    if (found.sats < btcToSats(amount.value)) return null;
+    if (sats < btcToSats(amount.value)) return null;
     // First seen: the wallet's receive time when the address is the rail's own, else now.
     const own = await bitcoindCall("gettransaction", [proof.txid, true], this.wallet).catch(() => null);
     return own?.timereceived ? own.timereceived * 1000 : Date.now();

@@ -14,13 +14,15 @@
 //! | `proofReceived` | `activity` (a `PayeeRequest`) | the payee holds a proof to verify |
 //! | `activityUpdated` | `activity`, `previousStatus` (`null` when new) | a request sent, or a payment received, changed |
 //! | `paymentsResumed` | `outcomes` (`PaymentOutcome[]`) | payments left open were resumed: after a start, or when a `pay` answered after its limit |
+//! | `listReceived` | `list` (a `ReceivedList`), `previousVersion` (`null` when new) | a contact shared, changed or withdrew its Private Payment List |
+//! | `sharedListUpdated` | `list` (a `SharedList`) | the list this identity shares, or its recipients, changed |
 //! | `error` | `during`, `code`, `message` | a step of the feed loop failed; the loop goes on |
 //! | `feedStopped` | `reason` | the feed loop ended |
 //!
 //! The engine compares each read, and the state after each call that changes it, with what it
 //! saw before, from the state it had at `start`:
-//! a host reads the current state with `requests()` and `payeeActivity()` at start, and the
-//! events tell it what changed after. No event carries a key or a secret.
+//! a host reads the current state with `requests()`, `payeeActivity()`, `receivedLists()` and
+//! `sharedList()` at start, and the events tell it what changed after. No event carries a key or a secret.
 
 use js_sys::{Date, Function, JSON};
 use serde_json::{Map, Value};

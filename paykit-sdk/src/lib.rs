@@ -134,7 +134,7 @@ pub use pubky_dispatch_client::app::{
     App, AppConfig, AppEnv, JoinRequest, ProtocolSet, UserConfirmed,
 };
 pub use publish::history::PublicationConflict;
-pub use publish::UnknownListDelivery;
+pub use publish::{SharedList, UnknownListDelivery};
 pub use rail::{
     CandidateError, CandidateId, EndpointSelection, PaymentEndpointCandidate, Rail,
     RailDeclaration, RailError, RailOutcome, RailPaid, RailPayment, Transfer,
@@ -144,6 +144,7 @@ pub use receive::{
     HeldList, KEPT_MESSAGE_MS, LISTS_REFRESH_MS, MAX_KEPT_REPLIES, MAX_KEPT_REPLIES_PER_SENDER,
 };
 pub use reconcile::{Doubtful, ReconcileReport, Resolution};
+pub use records::ReceivedList;
 pub use refusal_reasons::{HeldForUserReason, ListingRetry, NotNowReason, RecoveryReason};
 pub use requests::{
     AcceptOptions, MessageDelivery, PayeeActivity, PayeeStatus, RequestDraft, RequestRef,

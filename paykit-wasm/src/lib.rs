@@ -23,13 +23,18 @@
 //!   requests it sent and the payments it received as payee; `payments()`: the payer's
 //!   payments, with their receipts; `requestReceipts(id)`: the receipts of one request.
 //! - Payee: `sendRequest(request)` signs and sends a Payment Request, to endpoints the host
-//!   supplies (such as a fresh address) or to any of the identity's endpoints;
+//!   supplies (such as a fresh address) or to any of the identity's Private Payment Lists;
 //!   `verifyPayment(record)` checks a received proof with the host's `rail.verify`;
 //!   `confirmPayment(record)` verifies it and sends the payer a receipt;
 //!   `cancelSentRequest(record)`.
 //! - Payer: `payRequest(id)` pays a request through the host's `rail.pay` and sends the proof;
 //!   `rejectRequest(id)`; `resumePayments()` finishes payments left open, which the feed loop
 //!   also does after a start and whenever a slow `pay` answers.
+//! - Private Payment Lists: `setListEndpoints(endpoints)` sets the reusable payment details
+//!   this identity shares; `publishListTo(identity)` shares them with a contact, and
+//!   `withdrawListFrom(identity)` stops; `sharedList()` reads what is shared and with whom;
+//!   `receivedLists()` reads the lists contacts shared with this identity. A request with
+//!   destination `{type: "any"}` is paid to one of the payee's lists.
 //! - `receive()`: one receive round, for a host that drives the feed itself.
 //! - `signerTick()`: the signer's due work, which the feed loop also runs once a minute.
 //! - `stop()`: closes the signer and the app, releasing their stores.
@@ -156,6 +161,9 @@ export type RailOutcome =
 /** A received proof for the payee's method to check. */
 export interface RailProofCheck {
   endpointId: string;
+  /** The endpoint's payload as the payee signed it; `null` for a request with destination
+   * `any` or `app`, whose payment the method checks against its own endpoints for
+   * `endpointId`, such as the addresses in its Private Payment List. */
   payload: string | null;
   amount: RailAmount;
   attemptId: string;
@@ -268,7 +276,8 @@ export interface RequestInput {
    * characters, no control characters. */
   paymentReference: string;
   /** Where to pay: endpoints the host supplies, such as `[{identifier: "btc-regtest-p2tr",
-   * payload: "{\"value\":\"<address>\"}"}]`; or any current endpoint of the identity. */
+   * payload: "{\"value\":\"<address>\"}"}]`; or `any`: an endpoint of the Private Payment
+   * List this identity shared with the payer, or its public endpoints. */
   destination: RequestDestination;
   /** The last time the payer may act on it, in Unix ms. */
   proposalExpiresAtMs?: number;
@@ -288,6 +297,56 @@ export interface SentRequest {
 export interface PayRequestOptions {
   /** The Payment Endpoint Identifier to pay; the first usable one otherwise. */
   endpoint?: string;
+  /** For a request whose destination is `any` or `app`: the App ID (base64url) of the payee
+   * app whose Private Payment List to pay; any current one otherwise. */
+  listApp?: string;
+  /** For a request whose destination is `any` or `app`: `private` (the default) pays an
+   * endpoint of the payee's Private Payment Lists; `public` pays the payee's public
+   * endpoints, and is passed only when the user chose them. */
+  mode?: "private" | "public";
+}
+
+/** A reusable Payment Endpoint of a Private Payment List. */
+export interface ListEndpoint {
+  /** The Payment Endpoint Identifier, such as `btc-regtest-p2tr`. */
+  identifier: string;
+  /** The payload, such as `{"value":"<address>"}`. */
+  payload: string;
+}
+
+/** A Private Payment List's version: greater for each newer list of one app to one
+ * contact. */
+export interface ListVersion {
+  generation: number;
+  counter: number;
+}
+
+/** A Private Payment List a contact shared with this identity: its latest version from one
+ * of the contact's apps. */
+export interface ReceivedList {
+  /** The contact's Pubky ID. */
+  payee: string;
+  /** The contact's app that published it (base64url): `payRequest`'s `listApp`. */
+  appId: string;
+  version: ListVersion;
+  /** Empty once the contact withdrew its details. */
+  endpoints: ListEndpoint[];
+  /** When this identity's inbox accepted it, in Unix ms. */
+  acceptedAtMs: number | null;
+  /** From this instant (Unix ms) no payment uses it: the earlier of its expiry and 30 days
+   * after it was accepted. */
+  usableUntilMs: number;
+  /** It has endpoints and has not expired, as of the read. A payment checks it again. */
+  usable: boolean;
+}
+
+/** The Private Payment List this identity shares, and with whom. */
+export interface SharedList {
+  /** As `setListEndpoints` last set them; `null` before it was called. */
+  endpoints: ListEndpoint[] | null;
+  /** The contacts it is shared with (Pubky IDs): chosen with `publishListTo` and not
+   * withdrawn since. Each is sent the current list, now or at a later round. */
+  recipients: string[];
 }
 
 /** What became of a payment (paykit-ffi `PaymentOutcome`): `paid` (the proof is sent or
@@ -374,6 +433,8 @@ export type EngineEvent = { atMs: number } & (
   | { type: "proofReceived"; activity: PayeeRequest }
   | { type: "activityUpdated"; activity: PayeeRequest; previousStatus: string | null }
   | { type: "paymentsResumed"; outcomes: PaymentOutcome[] }
+  | { type: "listReceived"; list: ReceivedList; previousVersion: ListVersion | null }
+  | { type: "sharedListUpdated"; list: SharedList }
   | { type: "error"; during: string; code: string; message: string }
   | { type: "feedStopped"; reason: string }
 );
@@ -645,7 +706,9 @@ export interface ResetOptions {
     ///
     /// `invalid_input`; `refused` when the request is not payable, nothing paid, with
     /// `reason` such as `alreadyPaid`, `paymentInProgress`, `rejected`, `cancelled`,
-    /// `noDestination`, `unsupportedEndpoint` or `attemptFailed`; `conflict`; `not_started`,
+    /// `noDestination`, `unsupportedEndpoint` or `attemptFailed`, or for a request with
+    /// destination `any` `waitingForList` (no usable list from the payee yet: the engine has
+    /// asked it for one; try again after `listReceived`); `conflict`; `not_started`,
     /// `busy`, or `paykit`. A failure after money may have moved is never an error: it is the
     /// `pending` or `uncertain` outcome.
     #[wasm_bindgen(js_name = payRequest, unchecked_return_type = "PaymentOutcome")]
@@ -807,6 +870,120 @@ export interface ResetOptions {
             .map_err(|error| EngineError::sdk("read the receipts", &error))?;
         drop(turn);
         let list: Vec<Value> = receipts.iter().map(views::receipt).collect();
+        Ok(to_js(&Value::Array(list)))
+    }
+
+    /// Sets the reusable Private Payment List this identity shares (`ListEndpoint[]`), such
+    /// as `[{identifier: "btc-regtest-p2tr", payload: "{\"value\":\"<address>\"}"}]`. Each
+    /// contact it is shared with is sent the changed list, now or at a later round; an empty
+    /// list withdraws the details from all of them. Emits `sharedListUpdated`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` (`scopeMissing`, `notNow`, ...); `not_started`, `busy`, or
+    /// `paykit`.
+    #[wasm_bindgen(js_name = setListEndpoints)]
+    pub async fn set_list_endpoints(
+        #[wasm_bindgen(unchecked_param_type = "ListEndpoint[]")] endpoints: JsValue,
+    ) -> Result<(), JsValue> {
+        let endpoints = inputs::list_endpoints(&endpoints)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let set = Box::pin(turn.paykit.set_list_endpoints(endpoints))
+            .await
+            .map_err(|error| EngineError::sdk("set the list's endpoints", &error));
+        list_changed(&engine, &mut turn, set).await
+    }
+
+    /// Shares the list `setListEndpoints` set with the contact `identity` (a Pubky ID): a
+    /// signed Private Payment List goes to its inbox, now or at a later round. The contact
+    /// must admit this identity (its `allowConnect`). Emits `sharedListUpdated`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused`: `usage` before the list is set or for this identity
+    /// itself, `heldForUser` while the deny list holds the contact, `notNow` while an
+    /// earlier publication to it is unresolved (a later round sends it), or
+    /// `listDeliveryUnknown`; `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = publishListTo)]
+    pub async fn publish_list_to(identity: String) -> Result<(), JsValue> {
+        let recipient = views::identity_key(&identity)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let published = Box::pin(turn.paykit.publish_list_to(recipient))
+            .await
+            .map_err(|error| EngineError::sdk("share the list", &error));
+        list_changed(&engine, &mut turn, published).await
+    }
+
+    /// Stops sharing the list with the contact `identity`: an empty list supersedes what it
+    /// holds. Emits `sharedListUpdated`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` (`notNow`, `listDeliveryUnknown`); `not_started`, `busy`,
+    /// or `paykit`.
+    #[wasm_bindgen(js_name = withdrawListFrom)]
+    pub async fn withdraw_list_from(identity: String) -> Result<(), JsValue> {
+        let recipient = views::identity_key(&identity)?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let withdrawn = Box::pin(turn.paykit.withdraw_list_from(recipient))
+            .await
+            .map_err(|error| EngineError::sdk("stop sharing the list", &error));
+        list_changed(&engine, &mut turn, withdrawn).await
+    }
+
+    /// After a list call: sends what it queued, tells the host what changed, including the
+    /// shared list (the call may have changed it before it failed), and returns its result.
+    async fn list_changed(
+        engine: &Rc<Engine>,
+        turn: &mut Turn,
+        result: Result<(), EngineError>,
+    ) -> Result<(), JsValue> {
+        feed::deliver(engine, turn).await;
+        if let Err(error) = feed::observe_shared(engine, turn).await {
+            if result.is_ok() {
+                return Err(error.into());
+            }
+        }
+        result.map_err(JsValue::from)
+    }
+
+    /// The Private Payment List this identity shares, and the contacts it is shared with
+    /// (`SharedList`).
+    ///
+    /// # Errors
+    ///
+    /// `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = sharedList, unchecked_return_type = "SharedList")]
+    pub async fn shared_list() -> Result<JsValue, JsValue> {
+        let engine = engine()?;
+        let turn = Turn::take(&engine).await?;
+        let view = feed::observe_shared(&engine, &turn).await?;
+        Ok(to_js(&view))
+    }
+
+    /// The Private Payment Lists contacts shared with this identity (`ReceivedList[]`): the
+    /// latest from each of their apps, a withdrawn one with no endpoints. `listReceived`
+    /// tells each new one.
+    ///
+    /// # Errors
+    ///
+    /// `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = receivedLists, unchecked_return_type = "ReceivedList[]")]
+    pub async fn received_lists() -> Result<JsValue, JsValue> {
+        let engine = engine()?;
+        let turn = Turn::take(&engine).await?;
+        let lists = Box::pin(turn.paykit.received_lists())
+            .await
+            .map_err(|error| EngineError::sdk("read the received lists", &error))?;
+        drop(turn);
+        let now = feed::now_ms();
+        let list: Vec<Value> = lists
+            .iter()
+            .map(|list| views::received_list(list, now))
+            .collect();
         Ok(to_js(&Value::Array(list)))
     }
 

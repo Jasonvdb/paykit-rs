@@ -3,7 +3,7 @@
 // of headless Chrome, with the Origin Private File System on disk, against a live Dispatch, a
 // Homeserver with the fake Homeserver's API and, for `peer`, a native peer (`paykit-peer`).
 //
-//   node paykit-wasm/www/smoke.mjs --pkg <engine module folder> [--scenario start|peer|flow|all]
+//   node paykit-wasm/www/smoke.mjs --pkg <engine module folder> [--scenario start|peer|flow|list|all]
 //
 // Environment: see `settings` in harness.mjs (PAYKIT_WASM_DISPATCH_ORIGIN,
 // PAYKIT_WASM_DISPATCH_LISTENER, PAYKIT_WASM_HOMESERVER, PAYKIT_WASM_PROFILE_ROOT,
@@ -48,6 +48,21 @@
 //             an identity that does not admit it yet.
 //          Each payment's transaction is checked in bitcoind: it pays the requested address
 //          exactly the requested amount.
+//   list   Private Payment Lists and requests with destination "any", between the browser
+//          engine W and a native peer N (`run --auto-pay --auto-confirm`) that allow each other.
+//          1. Before anything, W shares no list and holds none; sharing before the list is set
+//             is refused (usage), and malformed endpoints are invalid_input.
+//          2. W sets its list to a fresh P2TR address of its method (btc-regtest-p2tr) and
+//             publishes it to N: sharedListUpdated and sharedList() name N; N's inbox gets it.
+//          3. N publishes its list (a P2WPKH address) to W: W's listReceived and
+//             receivedLists() hold N's address, usable.
+//          4. N requests 13,000 sats from W with destination any: W pays N's private list
+//             address; N verifies and confirms; W gets the receipt.
+//          5. W requests 14,000 sats from N with destination any: N pays W's private list
+//             address (so N holds W's list); W verifies and confirms; N gets the receipt.
+//          6. W's worker is terminated; a new worker loads: receivedLists() and sharedList()
+//             are unchanged, and N's list is not told again.
+//          7. W withdraws its list from N: sharedListUpdated names no recipient.
 // Each run enrols new random identities on the Dispatch, which keeps them. No secret is
 // printed. Every wait is on an event or a call's answer, never on a sleep.
 
@@ -71,8 +86,8 @@ import {
 const { values: flags } = parseArgs({
   options: { pkg: { type: "string" }, scenario: { type: "string", default: "all" } },
 });
-if (!flags.pkg || !["start", "peer", "flow", "all"].includes(flags.scenario)) {
-  console.error("usage: smoke.mjs --pkg <engine module folder> [--scenario start|peer|flow|all]");
+if (!flags.pkg || !["start", "peer", "flow", "list", "all"].includes(flags.scenario)) {
+  console.error("usage: smoke.mjs --pkg <engine module folder> [--scenario start|peer|flow|list|all]");
   process.exit(2);
 }
 
@@ -538,6 +553,196 @@ async function flowScenario(harness) {
   log(`flow: PASS (W ${wId}, N ${n.identity}; txids a ${recordA.txid.slice(0, 12)}..., b ${paidB.txid.slice(0, 12)}..., c ${recordC.txid.slice(0, 12)}..., d ${recordD.txid.slice(0, 12)}...)`);
 }
 
+/** The endpoints of a ReceivedList or SharedList as `identifier -> address`. */
+function addresses(endpoints) {
+  return Object.fromEntries((endpoints ?? []).map((e) => [e.identifier, JSON.parse(e.payload).value]));
+}
+
+/** The P4 gate: Private Payment Lists both ways, and requests with destination any both ways. */
+async function listScenario(harness) {
+  const n = await harness.startPeer({
+    name: "p4-peer",
+    args: ["--auto-pay", "--auto-confirm", "--fund", "300000"],
+  });
+  await n.waitFor((event) => event.event === "funded", { what: "N funded" });
+  const rail = await harness.openRail("l", { fundSats: 300_000 });
+  const { secret, identity: wId } = newIdentity();
+  const options = harness.startOptions(secret, { railUrl: rail.url });
+  const w = await harness.openEngine("l1");
+  const started = await w.must("start", options);
+  log(`list: W ${wId} (${started.enrolment}), N ${n.identity}`);
+  await w.must("allowConnect", n.identity);
+  await n.command(`allow ${wId}`);
+
+  // 1. Nothing shared or held yet; typed refusals.
+  const none = await w.must("sharedList");
+  check(none.endpoints === null && none.recipients.length === 0, "1: W shares no list before setListEndpoints");
+  check((await w.must("receivedLists")).length === 0, "1: W holds no list from a contact yet");
+  const early = await w.call("publishListTo", n.identity);
+  check(!early.ok && early.code === "refused" && early.reason === "usage", `1: sharing before the list is set is refused (${early.code} ${early.reason})`);
+  const badId = await w.call("setListEndpoints", [{ identifier: "../private", payload: "{}" }]);
+  check(!badId.ok && badId.code === "invalid_input", "1: an invalid Payment Endpoint Identifier is invalid_input");
+  const twice = await w.call("setListEndpoints", [
+    { identifier: "btc-regtest-p2tr", payload: "{\"value\":\"a\"}" },
+    { identifier: "btc-regtest-p2tr", payload: "{\"value\":\"b\"}" },
+  ]);
+  check(!twice.ok && twice.code === "invalid_input", "1: an identifier named twice is invalid_input");
+  const malformed = await w.call("publishListTo", "not-a-pubky-id");
+  check(!malformed.ok && malformed.code === "invalid_input", "1: a malformed contact is invalid_input");
+
+  // 2. W shares its list, a fresh P2TR address, with N.
+  const wAddress = await rail.listAddress("bech32m");
+  const wEndpoints = [{ identifier: "btc-regtest-p2tr", payload: JSON.stringify({ value: wAddress }) }];
+  await w.must("setListEndpoints", wEndpoints);
+  const set = await w.waitFor(
+    (event) => event.type === "sharedListUpdated" && event.list.endpoints !== null,
+    { what: "sharedListUpdated after setListEndpoints" },
+  );
+  check(addresses(set.list.endpoints)["btc-regtest-p2tr"] === wAddress && set.list.recipients.length === 0, "2: sharedListUpdated holds W's P2TR address, shared with no one yet");
+  const inboxFrom = n.log.events.length;
+  await w.must("publishListTo", n.identity);
+  const sharedEvent = await w.waitFor(
+    (event) => event.type === "sharedListUpdated" && event.list.recipients.includes(n.identity),
+    { what: "sharedListUpdated naming N" },
+  );
+  check(sharedEvent.list.recipients.length === 1, "2: sharedListUpdated names N as the one recipient");
+  const shared = await w.must("sharedList");
+  check(
+    shared.recipients.length === 1 && shared.recipients[0] === n.identity && addresses(shared.endpoints)["btc-regtest-p2tr"] === wAddress,
+    "2: sharedList() gives W's P2TR address, shared with N",
+  );
+  await n.waitFor((event) => event.event === "app_event" && event.kind === "MessageReceived", {
+    what: "N's inbox receiving W's list",
+    from: inboxFrom,
+    timeoutMs: 60_000,
+  });
+  log("ok: 2: N's inbox received a message after W published its list");
+
+  // 3. N shares its list with W.
+  const publishFrom = n.log.events.length;
+  await n.command(`publish-list ${wId}`);
+  const published = await n.waitFor((event) => event.event === "list_published" && event.to === wId, {
+    what: "N's list_published",
+    from: publishFrom,
+  });
+  log(`N published its list: ${published.endpoint_id} ${published.address}`);
+  const got = await w.waitFor(
+    (event) => event.type === "listReceived" && event.list.payee === n.identity,
+    { what: "W's listReceived from N", timeoutMs: 60_000 },
+  );
+  check(
+    got.list.endpoints.length === 1 && addresses(got.list.endpoints)[published.endpoint_id] === published.address,
+    `3: W's listReceived holds N's ${published.endpoint_id} address`,
+  );
+  check(got.previousVersion === null && got.list.usable && typeof got.list.acceptedAtMs === "number", "3: it is N's first list, usable, with its acceptance time");
+  check(got.list.usableUntilMs > Date.now(), "3: it is usable until a time to come");
+  check(/^[A-Za-z0-9_-]{22}$/.test(got.list.appId) && got.list.version.generation >= 1 && got.list.version.counter >= 1, "3: it names N's app and its version");
+  const held = await w.must("receivedLists");
+  check(
+    held.length === 1 && held[0].payee === n.identity && addresses(held[0].endpoints)[published.endpoint_id] === published.address,
+    "3: receivedLists() holds N's list",
+  );
+
+  // 4. N requests from W with destination any: W pays N's private list address.
+  const reqFrom = n.log.events.length;
+  await n.command(`request ${wId} 13000 --any --reference list-a`);
+  const sentA = await n.waitFor((event) => event.event === "request_sent" && event.to === wId, {
+    what: "N's any request_sent",
+    from: reqFrom,
+  });
+  check(sentA.destination === "any" && sentA.address === null, "4: N's request names no endpoint (destination any)");
+  const receivedA = await w.waitFor(
+    (event) => event.type === "requestReceived" && event.request.id.requestHash === sentA.request_hash,
+    { what: "W's requestReceived for the any request" },
+  );
+  check(receivedA.request.destination.type === "any", "4: W's request shows destination any");
+  const paidA = await w.must("payRequest", receivedA.request.id, { listApp: got.list.appId });
+  check(paidA.outcome === "paid", "4: payRequest pays it (paid)");
+  const recordA = rail.attempts.get(paidA.attemptId);
+  check(
+    recordA?.address === published.address && recordA.endpointId === published.endpoint_id,
+    `4: W's method paid N's private list address ${published.address.slice(0, 14)}...`,
+  );
+  const confirmedA = await n.waitFor(
+    (event) => event.event === "confirmed" && event.request_hash === sentA.request_hash,
+    { what: "N's confirmed for the any request", timeoutMs: 90_000 },
+  );
+  const verifiedA = n.log.events.find((event) => event.event === "verified" && event.request_hash === sentA.request_hash);
+  check(verifiedA?.sats_received === 13_000, `4: N verified 13000 sats on-chain (${verifiedA?.sats_received})`);
+  check(confirmedA.txid === recordA.txid, "4: N confirmed the transaction W's method sent");
+  const receiptA = await w.waitFor(
+    (event) => event.type === "receiptReceived" && event.request.id.requestHash === sentA.request_hash,
+    { what: "W's receiptReceived for the any request", timeoutMs: 90_000 },
+  );
+  check(receiptA.receipt.messageId === confirmedA.receipt_msg_id && receiptA.receipt.attemptId === paidA.attemptId, "4: W's receipt is the one N sent, for W's attempt");
+  await checkChain(confirmedA.txid, published.address, 13_000, "4");
+
+  // 5. W requests from N with destination any: N pays W's private list address.
+  const sentB = await w.must("sendRequest", {
+    to: n.identity,
+    amount: { value: satsToBtc(14_000), asset: "btc" },
+    paymentReference: "list-b",
+    destination: { type: "any" },
+  });
+  const hashB = sentB.request?.requestHash;
+  check(/^[0-9a-f]{64}$/.test(hashB ?? ""), `5: sendRequest with destination any gives the request (delivery ${sentB.delivery})`);
+  const paidB = await n.waitFor((event) => event.event === "paid" && event.request_hash === hashB, {
+    what: "N paid W's any request",
+    timeoutMs: 90_000,
+  });
+  check(
+    paidB.address === wAddress && paidB.endpoint_id === "btc-regtest-p2tr" && paidB.sats === 14_000,
+    "5: N paid W's private list address 14,000 sats: N holds W's list",
+  );
+  const proofB = await w.waitFor(
+    (event) => event.type === "proofReceived" && event.activity.requestHash === hashB,
+    { what: "W's proofReceived for the any request", timeoutMs: 90_000 },
+  );
+  check(proofB.activity.attemptId === paidB.attempt_id, "5: the proof is N's attempt");
+  const verifiedB = await w.must("verifyPayment", proofB.activity.record);
+  check(typeof verifiedB === "number", `5: verifyPayment confirms it on-chain (paid at ${verifiedB})`);
+  const receiptB = await w.must("confirmPayment", proofB.activity.record);
+  check(typeof receiptB === "string" && receiptB.length > 0, `5: confirmPayment sends a receipt (${receiptB})`);
+  const gotB = await n.waitFor((event) => event.event === "receipt_received" && event.request_hash === hashB, {
+    what: "N's receipt for the any request",
+    timeoutMs: 90_000,
+  });
+  check(gotB.msg_id === receiptB && gotB.txid === paidB.txid, "5: N holds W's receipt for its transaction");
+  await checkChain(paidB.txid, wAddress, 14_000, "5");
+
+  // 6. A restart keeps both lists, and does not tell N's list again.
+  await w.terminate();
+  const w2 = await harness.openEngine("l2");
+  const restarted = await w2.must("start", options);
+  check(restarted.enrolment === "loaded", "6: the new worker loads the engine");
+  const heldAfter = await w2.must("receivedLists");
+  check(
+    heldAfter.length === 1 && addresses(heldAfter[0].endpoints)[published.endpoint_id] === published.address,
+    "6: after the restart, receivedLists() still holds N's list",
+  );
+  const sharedAfter = await w2.must("sharedList");
+  check(
+    sharedAfter.recipients.length === 1 && sharedAfter.recipients[0] === n.identity && addresses(sharedAfter.endpoints)["btc-regtest-p2tr"] === wAddress,
+    "6: after the restart, sharedList() still shares W's address with N",
+  );
+  await w2.must("receive");
+  check(w2.log.filter((event) => event.type === "listReceived").length === 0, "6: the restarted engine does not tell N's list again");
+
+  // 7. W withdraws its list from N.
+  await w2.must("withdrawListFrom", n.identity);
+  const withdrawn = await w2.waitFor(
+    (event) => event.type === "sharedListUpdated" && event.list.recipients.length === 0,
+    { what: "sharedListUpdated with no recipient" },
+  );
+  check(addresses(withdrawn.list.endpoints)["btc-regtest-p2tr"] === wAddress, "7: after the withdrawal W's list is kept, shared with no one");
+
+  const errors = [...w.events, ...w2.events].filter((event) => event.type === "error");
+  check(errors.length === 0, `no error events (${errors.map((e) => `${e.during}: ${e.code}: ${e.message}`).join("; ")})`);
+  await w2.must("stop");
+  await w2.terminate();
+  log(`list: PASS (W ${wId}, N ${n.identity}; txids 4 ${recordA.txid.slice(0, 12)}..., 5 ${paidB.txid.slice(0, 12)}...)`);
+}
+
 async function main() {
   await checkServices();
   const harness = await launch({ pkg: flags.pkg });
@@ -545,6 +750,7 @@ async function main() {
     if (flags.scenario === "start" || flags.scenario === "all") await startScenario(harness);
     if (flags.scenario === "peer" || flags.scenario === "all") await peerScenario(harness);
     if (flags.scenario === "flow" || flags.scenario === "all") await flowScenario(harness);
+    if (flags.scenario === "list" || flags.scenario === "all") await listScenario(harness);
     log(`PASS: ${flags.scenario}`);
   } finally {
     await harness.close();
