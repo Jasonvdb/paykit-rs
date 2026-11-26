@@ -15,6 +15,7 @@ use paykit_sdk::{
     PaymentEndpointIdentifier, PaymentReference, Rail, RequestDestination, RequestDraft,
     RequestStatus, Timer,
 };
+use pubky_dispatch_client::app::AppEvent;
 use pubky_dispatch_client::clock::{Clock, SystemClock};
 use pubky_dispatch_client::store::{StateStore, StoreHandle};
 use pubky_dispatch_client::transport::{BoxFuture, Transport};
@@ -34,7 +35,9 @@ use crate::bitcoind::Bitcoind;
 use crate::cli::{Command, Line};
 use crate::events::{emit, variant};
 use crate::homeserver::{FakeHomeserver, OwnHomeserver};
-use crate::rail::{address_payload, amount_sats, btc_amount, RegtestRail, P2TR, P2WPKH};
+use crate::rail::{
+    address_payload, amount_sats, btc_amount, payload_address, RegtestRail, P2TR, P2WPKH,
+};
 use crate::state::{hex, unhex, PeerConfig, StateDir};
 use crate::store::FileStore;
 use crate::transport::LoopbackListener;
@@ -43,6 +46,8 @@ use crate::transport::LoopbackListener;
 const SIGNER_TICK: Duration = Duration::from_secs(30);
 /// The most inbox pages one round reads before it handles what they brought.
 const PAGES_PER_ROUND: usize = 8;
+/// The message kind of a Private Payment List (Paykit wire 4.13).
+const PRIVATE_PAYMENT_LIST: &str = "paykit.private_payment_list";
 
 /// Where the peer's services are, from the command line.
 #[derive(Clone, Debug)]
@@ -512,6 +517,52 @@ impl Peer {
         Ok(())
     }
 
+    /// Print `list_received` for each Private Payment List held from `payee`, once per list
+    /// version: its endpoints with their addresses.
+    async fn report_lists(&mut self, payee: &[u8; 32]) {
+        let lists = match Box::pin(self.wallet.received_lists(payee)).await {
+            Ok(lists) => lists,
+            Err(error) => {
+                emit(
+                    "warning",
+                    json!({ "during": "received_lists", "from": pubky_id(payee), "error": error.to_string() }),
+                );
+                return;
+            }
+        };
+        for (app_id, list) in lists {
+            let endpoints: Vec<Value> = list
+                .payment_endpoints
+                .iter()
+                .map(|(identifier, endpoint)| {
+                    json!({
+                        "endpoint_id": identifier.as_str(),
+                        "address": payload_address(&endpoint.payload),
+                        "single_use": endpoint.single_use,
+                    })
+                })
+                .collect();
+            self.once(
+                format!(
+                    "list:{}:{}:{}:{}",
+                    hex(payee),
+                    hex(&app_id),
+                    list.version.generation(),
+                    list.version.counter()
+                ),
+                "list_received",
+                json!({
+                    "from": pubky_id(payee),
+                    "app_id": hex(&app_id),
+                    "generation": list.version.generation(),
+                    "counter": list.version.counter(),
+                    "expires_at_ms": list.expires_at,
+                    "endpoints": endpoints,
+                }),
+            );
+        }
+    }
+
     /// Print `name` once per `key` in this process.
     fn once(&mut self, key: String, name: &str, fields: Value) {
         if self.printed.insert(key) {
@@ -521,14 +572,23 @@ impl Peer {
 
     /// One round: read the inbox, send what is queued, then act as payer and as payee.
     async fn round(&mut self, auto_pay: bool, auto_confirm: bool) -> anyhow::Result<()> {
+        let mut list_senders = BTreeSet::new();
         for _ in 0..PAGES_PER_ROUND {
             let summary = Box::pin(self.wallet.receive(None)).await?;
             for event in &summary.report.events {
                 emit("app_event", json!({ "kind": variant(event) }));
+                if let AppEvent::MessageReceived { kind, sender, .. } = event {
+                    if kind == PRIVATE_PAYMENT_LIST {
+                        list_senders.insert(*sender);
+                    }
+                }
             }
             if !summary.report.more {
                 break;
             }
+        }
+        for sender in list_senders {
+            Box::pin(self.report_lists(&sender)).await;
         }
         if let Err(error) = Box::pin(self.wallet.flush()).await {
             self.once(
