@@ -1846,6 +1846,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "paykit-wasm"
+version = "0.2.0-alpha.0"
+dependencies = [
+ "js-sys",
+ "paykit-browser",
+ "paykit-lib",
+ "paykit-sdk",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
+ "pubky-dispatch-signer",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "zeroize",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
