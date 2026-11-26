@@ -18,7 +18,8 @@
 //! - `identity()`, `appId()`: the started engine's.
 //! - `allowConnect(identity)`: lets that identity start a conversation, as a payer does for a
 //!   payee it expects requests from (Dispatch spec 7). `admits(identity)` and `contacts()`
-//!   read the admission state.
+//!   read the admission state. `probeAdmission(identity)` and `messageDelivery(msgId)` tell
+//!   whether that identity admits this one.
 //! - `requests()`: the one-time requests this identity holds as payer; `payeeActivity()`: the
 //!   requests it sent and the payments it received as payee; `payments()`: the payer's
 //!   payments, with their receipts; `requestReceipts(id)`: the receipts of one request.
@@ -116,7 +117,8 @@ mod api {
     };
     use crate::turn::Turn;
     use crate::views::{self, Admission};
-    use paykit_sdk::ReceiptsOf;
+    use paykit_sdk::{ReceiptsOf, ResendSelection};
+    use pubky_dispatch_core::enc::random_bytes;
 
     #[wasm_bindgen(typescript_custom_section)]
     const TYPES: &'static str = r#"
@@ -639,6 +641,69 @@ export interface ResetOptions {
         }
         let denied: Vec<String> = list.deny.iter().map(pubky_id).collect();
         Ok(to_js(&json!({ "allowed": allowed, "denied": denied })))
+    }
+
+    /// Sends `identity` a `resend_request` that selects nothing (one fresh, unknown message
+    /// ID), so that its delivery tells whether `identity` admits this one: Paykit has no read
+    /// of the other side's allow list. Resolves to the request's message ID; read it with
+    /// `messageDelivery`. It stays `waitingForAdmission` until `identity` admits this one,
+    /// and turns `accepted` at the first delivery try after. The recipient has nothing to
+    /// re-send, and a `resend_request` adds no reply grant.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_input`; `refused` (`scopeMissing` for an app approved without
+    /// `paykit_contacts`, `heldForUser`); `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = probeAdmission)]
+    pub async fn probe_admission(identity: String) -> Result<String, JsValue> {
+        let peer = views::identity_key(&identity)?;
+        let unknown = random_uuid_v4()?;
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        let selection = ResendSelection::default().with_msg_ids(vec![unknown]);
+        let msg_id = Box::pin(turn.paykit.request_resend(peer, selection))
+            .await
+            .map_err(|error| EngineError::sdk("probe the admission", &error))?;
+        Ok(msg_id)
+    }
+
+    /// Where the message this app sent as `msgId` stands, after one try of the outbox:
+    /// `accepted`, `queued`, `kept`, `waitingForAdmission`, `certificateNotCurrent` or
+    /// `failed`; `null` when the client keeps nothing of it (accepted or ended long ago, or
+    /// not sent from these stores).
+    ///
+    /// # Errors
+    ///
+    /// `not_started`, `busy`, or `paykit`.
+    #[wasm_bindgen(js_name = messageDelivery, unchecked_return_type = "string | null")]
+    pub async fn message_delivery(msg_id: String) -> Result<JsValue, JsValue> {
+        let engine = engine()?;
+        let mut turn = Turn::take(&engine).await?;
+        feed::deliver(&engine, &mut turn).await;
+        let delivery = Box::pin(turn.paykit.message_delivery(&msg_id))
+            .await
+            .map_err(|error| EngineError::sdk("read the message's delivery", &error))?;
+        Ok(match delivery {
+            Some(delivery) => JsValue::from_str(&views::case_name(&delivery)),
+            None => JsValue::NULL,
+        })
+    }
+
+    /// A fresh lowercase UUID v4, as `resend_request` takes message IDs (Paykit wire 4.12).
+    fn random_uuid_v4() -> Result<String, EngineError> {
+        let mut bytes = random_bytes::<16>()
+            .map_err(|error| EngineError::paykit("draw a message ID", &error))?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex = views::hex(&bytes);
+        Ok(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        ))
     }
 
     /// The one-time requests this identity holds as payer (`OneTimeRequest[]`).

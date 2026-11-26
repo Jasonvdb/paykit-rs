@@ -19,7 +19,8 @@
 //          4. a fresh worker C with another secret on the same stores is refused
 //             (identity_mismatch).
 //   peer   1. a native peer N starts; the browser engine W starts.
-//          2. W allows N (admissionChanged, admits, contacts) and N allows W.
+//          2. W allows N (admissionChanged, admits, contacts); W's admission probe waits;
+//             N allows W, and the probe is accepted.
 //          3. N requests sats from W: W's feed loop gets it as messageReceived and
 //             requestReceived events, with N's amount, reference and endpoint.
 //          4. W's worker is terminated without stop, as a crash; a new worker starts the same
@@ -212,9 +213,25 @@ async function peerScenario(harness) {
   check(!(await w.must("admits", newIdentity().identity)), "W admits no stranger");
   const malformed = await w.call("allowConnect", "not-a-pubky-id");
   check(!malformed.ok && malformed.error.startsWith("invalid_input:"), "allowConnect refuses a malformed Pubky ID");
+  // W probes whether N admits it: the probe waits until N allows W, then is accepted.
+  const probe = await w.must("probeAdmission", n.identity);
+  check(
+    (await w.must("messageDelivery", probe)) === "waitingForAdmission",
+    "before N allows W, W's admission probe waits for admission",
+  );
+  check(
+    (await w.must("messageDelivery", "00000000-0000-4000-8000-000000000000")) === null,
+    "an unknown message has no delivery",
+  );
+  const badProbe = await w.call("probeAdmission", "not-a-pubky-id");
+  check(!badProbe.ok && badProbe.error.startsWith("invalid_input:"), "probeAdmission refuses a malformed Pubky ID");
   await n.command(`allow ${wId}`);
   await n.waitFor((event) => event.event === "allowed" && event.id === wId, { what: "N allowed W" });
   log("ok: N allows W");
+  check(
+    (await w.must("messageDelivery", probe)) === "accepted",
+    "after N allows W, W's admission probe is accepted",
+  );
 
   // 3. N requests from W.
   const sats = 12345;

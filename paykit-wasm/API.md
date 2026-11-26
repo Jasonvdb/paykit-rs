@@ -287,6 +287,8 @@ while it starts or stops). `paykit` is a client or store failure.
 | `allowConnect(identity)` | `Promise<void>`. Lets that identity start a conversation with this one: a reply grant at this identity's Dispatch, which also admits a pending connect request from it. A payer allows each payee it expects requests from; a contact pair allows each other. Emits `admissionChanged`. | `invalid_input`, `paykit` |
 | `admits(identity)` | `Promise<boolean>`: whether that identity may start a conversation, from this app's copy of the allow and deny lists | `invalid_input`, `paykit` |
 | `contacts()` | `Promise<Contacts>`: the allow list and deny list, read from the Dispatch. Emits `admissionChanged` for each change. | `paykit` |
+| `probeAdmission(identity)` | `Promise<string>`: sends that identity a `resend_request` that selects nothing (one fresh, unknown message ID), and resolves to its message ID. Its delivery tells whether that identity admits this one, which Paykit cannot read otherwise: `waitingForAdmission` until it does, `accepted` at the first delivery try after. The recipient has nothing to re-send, and the request adds no reply grant. | `invalid_input`, `refused` (`scopeMissing`, `heldForUser`), `paykit` |
+| `messageDelivery(msgId)` | `Promise<string \| null>`: tries the outbox once, then tells where the message this app sent as `msgId` stands: `accepted`, `queued`, `kept`, `waitingForAdmission`, `certificateNotCurrent` or `failed`; `null` when the client keeps nothing of it (accepted or ended long ago, or not sent from these stores) | `paykit` |
 
 ### Payer: requests received
 
@@ -695,7 +697,11 @@ The demo's regtest contract:
 uses the prefix.
 
 **Add a contact.** Both sides call `allowConnect(otherId)`. `admissionChanged` confirms it, and
-`contacts()` lists it.
+`contacts()` lists it. To show whether the other side has added this identity too, call
+`probeAdmission(otherId)` once, keep the message ID, and read `messageDelivery(msgId)` every few
+seconds: `accepted` means the contact admits this identity (connected both ways). A
+`messageReceived` from the contact means the same. If `messageDelivery` answers `null` (for
+example after the stores were reset), probe again.
 
 **Request money (payee).** `sendRequest({to, amount, paymentReference, destination: {type:
 "endpoints", endpoints: [{identifier: "btc-regtest-p2tr", payload: JSON.stringify({value:
