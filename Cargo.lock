@@ -1955,7 +1955,7 @@ dependencies = [
 [[package]]
 name = "pubky-dispatch"
 version = "0.1.0"
-source = "git+https://github.com/pubky/pubky-dispatch?rev=c2b19c95f5f60937df3995efda13e477e9b1ff47#c2b19c95f5f60937df3995efda13e477e9b1ff47"
+source = "git+https://github.com/Jasonvdb/pubky-dispatch?rev=0ea0904f30589ecbf3fece953fc2be0e96ecfd5b#0ea0904f30589ecbf3fece953fc2be0e96ecfd5b"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1987,7 +1987,7 @@ dependencies = [
 [[package]]
 name = "pubky-dispatch-client"
 version = "0.1.0"
-source = "git+https://github.com/pubky/pubky-dispatch?rev=c2b19c95f5f60937df3995efda13e477e9b1ff47#c2b19c95f5f60937df3995efda13e477e9b1ff47"
+source = "git+https://github.com/Jasonvdb/pubky-dispatch?rev=0ea0904f30589ecbf3fece953fc2be0e96ecfd5b#0ea0904f30589ecbf3fece953fc2be0e96ecfd5b"
 dependencies = [
  "blake3",
  "bytes",
@@ -2010,7 +2010,7 @@ dependencies = [
 [[package]]
 name = "pubky-dispatch-core"
 version = "0.1.0"
-source = "git+https://github.com/pubky/pubky-dispatch?rev=c2b19c95f5f60937df3995efda13e477e9b1ff47#c2b19c95f5f60937df3995efda13e477e9b1ff47"
+source = "git+https://github.com/Jasonvdb/pubky-dispatch?rev=0ea0904f30589ecbf3fece953fc2be0e96ecfd5b#0ea0904f30589ecbf3fece953fc2be0e96ecfd5b"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2029,7 +2029,7 @@ dependencies = [
 [[package]]
 name = "pubky-dispatch-harness"
 version = "0.1.0"
-source = "git+https://github.com/pubky/pubky-dispatch?rev=c2b19c95f5f60937df3995efda13e477e9b1ff47#c2b19c95f5f60937df3995efda13e477e9b1ff47"
+source = "git+https://github.com/Jasonvdb/pubky-dispatch?rev=0ea0904f30589ecbf3fece953fc2be0e96ecfd5b#0ea0904f30589ecbf3fece953fc2be0e96ecfd5b"
 dependencies = [
  "axum",
  "futures-util",
@@ -2048,8 +2048,10 @@ dependencies = [
 [[package]]
 name = "pubky-dispatch-signer"
 version = "0.1.0"
-source = "git+https://github.com/pubky/pubky-dispatch?rev=c2b19c95f5f60937df3995efda13e477e9b1ff47#c2b19c95f5f60937df3995efda13e477e9b1ff47"
+source = "git+https://github.com/Jasonvdb/pubky-dispatch?rev=0ea0904f30589ecbf3fece953fc2be0e96ecfd5b#0ea0904f30589ecbf3fece953fc2be0e96ecfd5b"
 dependencies = [
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "pubky-dispatch-client",
  "pubky-dispatch-core",
  "serde",
