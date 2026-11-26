@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,6 +79,9 @@ pub struct RegtestRail {
     history_path: Option<PathBuf>,
     /// Attempt ID (b64) -> the last proof verified for it.
     verified: Mutex<BTreeMap<String, Verified>>,
+    /// Satoshis to send less than each payment asks: 0 normally. A test sets it to check that
+    /// a payee refuses a short payment.
+    short_by: AtomicU64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -157,7 +161,14 @@ impl RegtestRail {
             history: Mutex::new(history),
             history_path,
             verified: Mutex::default(),
+            short_by: AtomicU64::new(0),
         })
+    }
+
+    /// Send `sats` less than each later payment asks (test only: the proof then names a
+    /// transaction that pays too little). 0 pays in full again.
+    pub fn set_short_by(&self, sats: u64) {
+        self.short_by.store(sats, Ordering::Relaxed);
     }
 
     pub fn node(&self) -> &Bitcoind {
@@ -247,6 +258,14 @@ impl RegtestRail {
         if sats == 0 {
             return Err(RailError::Refused("a zero amount".into()));
         }
+        let short_by = self.short_by.load(Ordering::Relaxed);
+        let sats = if short_by == 0 {
+            sats
+        } else {
+            sats.checked_sub(short_by)
+                .filter(|sent| *sent > 0)
+                .ok_or_else(|| RailError::Refused("the shortfall is the whole amount".into()))?
+        };
         let sent = self
             .node
             .call(

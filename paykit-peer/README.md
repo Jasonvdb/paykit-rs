@@ -53,7 +53,7 @@ paykit-peer [--state <dir>] [--dispatch-url http://127.0.0.1:18580] [--origin ht
 | `allow <id>` | Allow identity `<id>` to start a conversation (admission, `allow_connect`) |
 | `request <id> <sats> [--any\|--taproot] [--reference <text>]` | Request `<sats>` from `<id>`: to a new P2WPKH address (`btc-regtest-p2wpkh`), with `--taproot` to a new P2TR address (`getnewaddress "" bech32m`, `btc-regtest-p2tr`), or with `--any` to any of this identity's Private Payment Lists (`RequestDestination::Any`) |
 | `publish-list <id>` | Set this app's Private Payment List to a new P2WPKH address and publish it to `<id>` |
-| `run [--auto-pay] [--auto-confirm] [--fund <sats>] [--poll-ms 1000]` | Receive in a loop, print events, and take commands on stdin |
+| `run [--auto-pay] [--auto-confirm] [--fund <sats>] [--poll-ms 1000] [--short-pay <sats>]` | Receive in a loop, print events, and take commands on stdin. `--short-pay` (test only) pays that many satoshis less than each request asks, so a payee's verify can be checked against a transaction that pays too little; the `paid` event's `sats` is what was sent |
 
 `<id>` is a Pubky ID, with or without a `pubky` or `pk:` prefix.
 
