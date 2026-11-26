@@ -22,6 +22,7 @@ mod fixture_service;
 mod fixture_signer;
 mod flights;
 mod lists;
+mod local_dispatch;
 mod method;
 mod notices;
 mod opaque;
