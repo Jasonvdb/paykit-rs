@@ -94,6 +94,10 @@ pub enum Command {
         /// How long to wait between rounds, in ms.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
+        /// Test only: pay this many satoshis less than each request asks, so the proof names a
+        /// transaction that pays too little and the payee should not confirm it.
+        #[arg(long, value_name = "SATS")]
+        short_pay: Option<u64>,
     },
 }
 
@@ -179,7 +183,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             auto_confirm,
             fund,
             poll_ms,
+            short_pay,
         } => {
+            if let Some(sats) = short_pay {
+                peer.pay_short_by(sats);
+            }
             if let Some(sats) = fund {
                 Box::pin(peer.fund(sats)).await?;
             }

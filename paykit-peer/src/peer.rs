@@ -395,6 +395,11 @@ impl Peer {
         bail!("the app's first listing did not finish")
     }
 
+    /// Pay `sats` less than each payment asks from now on (test only).
+    pub fn pay_short_by(&self, sats: u64) {
+        self.rail.set_short_by(sats);
+    }
+
     /// Fund the peer's bitcoind wallet up to `sats`. Prints `funded`.
     pub async fn fund(&mut self, sats: u64) -> anyhow::Result<()> {
         let node = self.rail.node().clone();
