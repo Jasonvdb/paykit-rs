@@ -269,6 +269,12 @@ again to finish).
 | `appId(): string` | the started engine's App ID (sync). `not_started`, `busy`. |
 | `version(): string` | the crate's version (sync), callable before `start` |
 
+The declarations also list `instantiated()`. It runs by itself when the module is initialised
+(it installs the panic hook); do not call it.
+
+In the TypeScript declarations, `resetIdentity`'s parameter is `ResetOptions | undefined`, not
+optional: in TypeScript, call `resetIdentity(undefined)` rather than `resetIdentity()`.
+
 ## 5. Calls
 
 All calls below need a started engine: otherwise they reject with `not_started` (or `busy`
