@@ -479,6 +479,7 @@ impl Paykit {
                 receipt: None,
                 manual_only: self.came_back_from_block(&stored).await?,
                 periods: Vec::new(),
+                destination: request.destination.clone(),
             });
         }
         Ok(out)

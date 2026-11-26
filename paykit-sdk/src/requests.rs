@@ -496,6 +496,19 @@ pub struct RequestView {
     /// A recurring request's period records this app holds, in period order, as its copy
     /// shows them: for display.
     pub periods: Vec<PeriodView>,
+    /// Where the request is paid, as its signed body names it (Paykit wire 4.5): the
+    /// payee's own endpoints, a required payee app, or any of the payee's current Private
+    /// Payment Lists or public endpoints. For display: a payment chooses among them again.
+    pub destination: RequestDestination,
+}
+
+/// The kind of a request's destination, for `Debug`: no endpoint or payload.
+fn destination_kind(destination: &RequestDestination) -> &'static str {
+    match destination {
+        RequestDestination::Endpoints(_) => "Endpoints",
+        RequestDestination::RequiredApp(_) => "RequiredApp",
+        RequestDestination::Any => "Any",
+    }
 }
 
 impl std::fmt::Debug for RequestView {
@@ -518,6 +531,7 @@ impl std::fmt::Debug for RequestView {
             .field("receipt", &self.receipt)
             .field("manual_only", &self.manual_only)
             .field("periods", &self.periods)
+            .field("destination", &destination_kind(&self.destination))
             .finish()
     }
 }
@@ -2169,6 +2183,7 @@ impl Paykit {
             receipt: received_receipt(record_key, record, Some(request)),
             manual_only,
             periods,
+            destination: request.destination.clone(),
         }))
     }
 
