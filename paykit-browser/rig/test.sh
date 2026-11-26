@@ -3,6 +3,7 @@
 #
 #   paykit-browser/rig/test.sh [--dispatch] <chromium|firefox|webkit|chrome|all> [page|worker|both] [cargo test args...]
 #   paykit-browser/rig/test.sh --harness <chromium|firefox|webkit|chrome|all>
+#   paykit-browser/rig/test.sh --local-dispatch <chromium|firefox|webkit|chrome|all> [page|worker|both] [cargo test args...]
 #
 # "all" is Playwright's chromium, firefox and webkit; "chrome" is the installed Google Chrome.
 # The context defaults to both. Any further arguments go to `cargo test`, such as a test name
@@ -69,15 +70,31 @@
 #
 # The bundle goes where rig/harness/build.sh puts it:
 # <cargo target directory>/paykit-browser-harness/<profile>/.
+#
+# --local-dispatch is for local development only. It runs the local targets (local_targets
+# below), and only it runs them, against a Pubky Dispatch that already runs on this machine:
+# it starts nothing and stops nothing. The Dispatch's origin is an https://localhost label that
+# nothing serves with TLS; the requests go to a plain HTTP listener on loopback that answers
+# CORS for loopback pages, through FetchTransport::for_local_development. The run checks that
+# the listener answers, passes both values to the test build at compile time, and has
+# runner.mjs open the test page on http://localhost:<port> rather than http://127.0.0.1:<port>,
+# the shape of a local web app's origin. It reads:
+#
+#   PAYKIT_BROWSER_LOCAL_DISPATCH_ORIGIN    the Dispatch's origin. Default https://localhost:18580.
+#   PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER  the plain listener. Default http://127.0.0.1:18580.
 
 set -euo pipefail
 
 # The test targets that need the Dispatch service; they run only with --dispatch.
 network_targets=(fetch_transport dispatch_flow transport_faults dispatch_faults dispatch_http)
+# The test targets that need a Dispatch already running on this machine, for local development
+# only; they run only with --local-dispatch.
+local_targets=(local_dispatch)
 
 usage() {
   echo "usage: $0 [--dispatch] <chromium|firefox|webkit|chrome|all> [page|worker|both] [cargo test args...]" >&2
   echo "       $0 --harness <chromium|firefox|webkit|chrome|all>" >&2
+  echo "       $0 --local-dispatch <chromium|firefox|webkit|chrome|all> [page|worker|both] [cargo test args...]" >&2
   exit 2
 }
 
@@ -88,8 +105,12 @@ die() {
 
 dispatch=0
 harness=0
+local_dispatch=0
 if [[ "${1:-}" == "--dispatch" ]]; then
   dispatch=1
+  shift
+elif [[ "${1:-}" == "--local-dispatch" ]]; then
+  local_dispatch=1
   shift
 elif [[ "${1:-}" == "--harness" ]]; then
   # The harness runs against the Dispatch service, so it starts it as --dispatch does.
@@ -140,6 +161,14 @@ is_network_target() {
   return 1
 }
 
+is_local_target() {
+  local target
+  for target in "${local_targets[@]}"; do
+    [[ "$target" == "$1" ]] && return 0
+  done
+  return 1
+}
+
 # The `--test` targets among the cargo arguments, up to `--`, after which the arguments go to
 # the test binaries.
 given_targets=0
@@ -168,6 +197,12 @@ for arg in "$@"; do
   if [[ $dispatch -eq 0 ]] && is_network_target "$target"; then
     die "the test target $target needs the Dispatch service; run it with --dispatch"
   fi
+  if [[ $local_dispatch -eq 0 ]] && is_local_target "$target"; then
+    die "the test target $target needs a Dispatch on this machine; run it with --local-dispatch"
+  fi
+  if [[ $local_dispatch -eq 1 ]] && ! is_local_target "$target"; then
+    die "--local-dispatch runs only the local targets: ${local_targets[*]}"
+  fi
 done
 
 # Without `--test`, the targets of this mode, named one by one, so the network targets stay out
@@ -176,7 +211,11 @@ done
 # library is left out.
 targets=()
 if [[ $given_targets -eq 0 ]]; then
-  if [[ $dispatch -eq 1 ]]; then
+  if [[ $local_dispatch -eq 1 ]]; then
+    for target in "${local_targets[@]}"; do
+      targets+=(--test "$target")
+    done
+  elif [[ $dispatch -eq 1 ]]; then
     for target in "${network_targets[@]}"; do
       targets+=(--test "$target")
     done
@@ -189,7 +228,7 @@ if [[ $given_targets -eq 0 ]]; then
         */main.rs) target=$(basename "$(dirname "$file")") ;;
         *) target=$(basename "$file" .rs) ;;
       esac
-      is_network_target "$target" || targets+=(--test "$target")
+      is_network_target "$target" || is_local_target "$target" || targets+=(--test "$target")
     done
   fi
 fi
@@ -494,6 +533,25 @@ if [[ $dispatch -eq 1 ]]; then
   export PAYKIT_BROWSER_RIG_TOKEN=$rig_token
 else
   unset PAYKIT_BROWSER_RIG_ORIGIN PAYKIT_BROWSER_RIG_CLOSED_PORT PAYKIT_BROWSER_RIG_TOKEN
+fi
+
+unset PAYKIT_BROWSER_PAGE_HOST
+if [[ $local_dispatch -eq 1 ]]; then
+  # Local development only: a Dispatch that already runs on this machine. The test transport
+  # checks the exact spelling of both values; here only that the listener answers.
+  export PAYKIT_BROWSER_LOCAL_DISPATCH_ORIGIN=${PAYKIT_BROWSER_LOCAL_DISPATCH_ORIGIN:-https://localhost:18580}
+  export PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER=${PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER:-http://127.0.0.1:18580}
+  [[ "$PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER" =~ ^http://(127\.0\.0\.1|localhost):[1-9][0-9]{0,4}$ ]] ||
+    die "PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER must be http://127.0.0.1:<port> or http://localhost:<port>"
+  code=0
+  curl -s -o /dev/null --max-time 5 "$PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER/" || code=$?
+  [[ $code -eq 0 ]] ||
+    die "nothing answers on $PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER (curl exit $code); start the local Dispatch first"
+  echo "== local Dispatch $PAYKIT_BROWSER_LOCAL_DISPATCH_ORIGIN through $PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER"
+  # The test page's origin: http://localhost:<port>, as a local web app's.
+  export PAYKIT_BROWSER_PAGE_HOST=localhost
+else
+  unset PAYKIT_BROWSER_LOCAL_DISPATCH_ORIGIN PAYKIT_BROWSER_LOCAL_DISPATCH_LISTENER
 fi
 
 failed=()

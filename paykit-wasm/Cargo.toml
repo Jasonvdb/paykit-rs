@@ -1,0 +1,45 @@
+# A Paykit engine for a browser wallet, as a WebAssembly module with a JavaScript API: one engine
+# per dedicated worker, with the identity's signer running in the same worker.
+#
+# A workspace member, so `--locked` and the workspace's settings and lock cover it. On every target
+# but `wasm32-unknown-unknown` it is an empty library: all its dependencies are in the target table
+# below, which resolver 2 leaves out of native builds, so a native `--workspace` build compiles
+# nothing of it and gets none of the features it turns on (paykit-lib's `signer`). Build it with
+# `-p paykit-wasm` for wasm32, never `--workspace`, which would also unify the test-only features
+# of the browser rig's harness into the graph. `build.sh` does it.
+[package]
+name = "paykit-wasm"
+description = "A Paykit engine for a browser wallet: the SDK and an in-process signer in a dedicated worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# The browser host pieces: `JsClock`, `JsTimer`, `run_local`, the panic hook, `FetchTransport`
+# and `OpfsStore`. Depending on it also selects the getrandom JavaScript backends for the graph.
+paykit-browser = { path = "../paykit-browser" }
+# Paykit's protocol for the signer, which the in-process signer registers.
+paykit-lib = { workspace = true, features = ["signer"] }
+paykit-sdk = { path = "../paykit-sdk" }
+pubky-dispatch-core.workspace = true
+pubky-dispatch-client.workspace = true
+# The identity's signer, in the same worker as the app: it enrols the identity on its first
+# start and approves the engine's app. Its client dependency has no default features in the
+# pinned fork, so it brings no native transport into the wasm32 graph.
+pubky-dispatch-signer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Wipes the decoded identity secret once the vault holds its own copy.
+zeroize = "1.9.1"
+js-sys = "0.3.107"
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"

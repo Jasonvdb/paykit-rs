@@ -1812,6 +1812,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
@@ -1859,6 +1860,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "web-time",
+]
+
+[[package]]
+name = "paykit-wasm"
+version = "0.2.0-alpha.0"
+dependencies = [
+ "js-sys",
+ "paykit-browser",
+ "paykit-lib",
+ "paykit-sdk",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
+ "pubky-dispatch-signer",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "zeroize",
 ]
 
 [[package]]

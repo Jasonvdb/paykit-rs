@@ -9,6 +9,9 @@ mod executor;
 mod extensions;
 mod host_calls;
 mod lists;
+mod live_dispatch;
+#[cfg(feature = "demo-signer")]
+mod live_signer;
 mod method;
 mod opaque;
 mod payee;

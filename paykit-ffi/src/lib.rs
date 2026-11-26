@@ -7,6 +7,8 @@ mod allowances;
 #[path = "../tests/hosts/checkout.rs"]
 mod checkout;
 mod config;
+#[cfg(feature = "demo-signer")]
+mod demo_signer;
 mod dispatch_refusal;
 mod enrollment;
 mod environment;
@@ -22,6 +24,7 @@ mod fixture_service;
 mod fixture_signer;
 mod flights;
 mod lists;
+mod local_dispatch;
 mod method;
 mod notices;
 mod opaque;
@@ -44,6 +47,8 @@ pub use allowances::*;
 #[cfg(feature = "test-wallet")]
 pub use checkout::{enrolled_test_checkout, CheckoutFixture};
 pub use config::*;
+#[cfg(feature = "demo-signer")]
+pub use demo_signer::*;
 pub use enrollment::*;
 pub use environment::*;
 pub use error::*;

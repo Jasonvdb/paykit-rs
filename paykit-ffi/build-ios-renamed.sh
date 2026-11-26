@@ -16,7 +16,8 @@
 # build and puts the manifest back on exit.
 #
 # Usage: CARGO_TARGET_DIR=... paykit-ffi/build-ios-renamed.sh [--static] PACKAGE_DIRECTORY
-# PAYKIT_V2_FEATURES sets the Cargo features (default: test-wallet; set it empty for none).
+# PAYKIT_V2_FEATURES sets the Cargo features (default: test-wallet,demo-signer; set it empty for
+# none). `demo-signer` exports the in-process signer the demo host approves its own app with.
 set -eu
 set -o pipefail
 
@@ -33,7 +34,7 @@ ffi=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$ffi/.."
 mkdir -p "$1"
 package=$(cd "$1" && pwd)
-features=${PAYKIT_V2_FEATURES-test-wallet}
+features=${PAYKIT_V2_FEATURES-test-wallet,demo-signer}
 config="$ffi/uniffi-ios-renamed.toml"
 lib=paykit_v2
 module=PaykitV2

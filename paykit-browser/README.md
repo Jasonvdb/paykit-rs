@@ -39,8 +39,12 @@ JavaScript host, and do not get them.
   rejected `fetch` is `TransportError::Other`, never `Connect`. The Dispatch origin must answer
   CORS requests and expose the signed response headers.
   `FetchTransport::allowing_localhost_for_loopback_tests` also allows those names, for tests
-  against a service on the local machine only. The type's docs list what it does and what it
-  cannot do.
+  against a service on the local machine only.
+  `FetchTransport::for_local_development(config, origin, listener)` is for local development
+  only: it sends every request signed for one `https://localhost[:<port>]` origin to a plain
+  HTTP listener on loopback (`http://127.0.0.1:<port>` or `http://localhost:<port>`), and
+  refuses every other origin. Nothing listens with TLS; the page must be served over plain
+  HTTP from loopback. The type's docs list what it does and what it cannot do.
 - `store::OpfsStore`: the Dispatch client's `StateStore` on the browser's Origin Private File
   System, with every snapshot sealed. See [Durable store](#durable-store) for what sealing
   protects and what it does not.

@@ -238,3 +238,124 @@ async fn test_fetch_refuses_requests_it_cant_send_as_signed() {
         );
     }
 }
+
+/// The local development transport takes only `https://localhost[:<port>]` as its origin and
+/// `http://127.0.0.1:<port>` or `http://localhost:<port>` as its listener, each spelled as the
+/// browser's URL parser spells it.
+#[wasm_bindgen_test]
+fn test_fetch_for_local_development_checks_origin_and_listener() {
+    let listener = "http://127.0.0.1:18580";
+    for origin in [
+        "https://localhost:18580",
+        "https://localhost",
+        "https://localhost:443",
+    ] {
+        assert!(
+            FetchTransport::for_local_development(FetchConfig::default(), origin, listener).is_ok(),
+            "{origin}"
+        );
+    }
+    for origin in [
+        "http://localhost:18580",
+        "https://LOCALHOST:18580",
+        "https://localhost.:18580",
+        "https://inbox.localhost:18580",
+        "https://127.0.0.1:18580",
+        "https://[::1]:18580",
+        "https://dispatch.invalid:18580",
+        "https://localhost:018580",
+        "https://localhost:0",
+        "https://localhost:",
+        "https://localhost:18580/",
+        "https://localhost:18580/v1",
+        "https://user@localhost:18580",
+        "https://localhostx:18580",
+    ] {
+        let error = FetchTransport::for_local_development(FetchConfig::default(), origin, listener)
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::Refused(_)),
+            "{origin}: {error:?}"
+        );
+    }
+    let origin = "https://localhost:18580";
+    for listener in ["http://127.0.0.1:18580", "http://localhost:8080"] {
+        assert!(
+            FetchTransport::for_local_development(FetchConfig::default(), origin, listener).is_ok(),
+            "{listener}"
+        );
+    }
+    for listener in [
+        "https://127.0.0.1:18580",
+        "http://127.0.0.1",
+        "http://127.0.0.1:80",
+        "http://127.0.0.1:018580",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:18580/",
+        "http://127.0.0.1:18580/v1",
+        "http://127.0.0.2:18580",
+        "http://[::1]:18580",
+        "http://LOCALHOST:18580",
+        "http://dispatch.invalid:18580",
+        "http://user@127.0.0.1:18580",
+    ] {
+        let error = FetchTransport::for_local_development(FetchConfig::default(), origin, listener)
+            .unwrap_err();
+        assert!(
+            matches!(error, TransportError::Refused(_)),
+            "{listener}: {error:?}"
+        );
+    }
+}
+
+/// The local development transport refuses every origin but its own before `fetch`, and
+/// sends its own to the listener only with the signed path and query unchanged. The
+/// listener here is on a port nothing is expected to serve, but every request is stopped
+/// before `fetch`: by the origin check, the path check, or the header check.
+#[wasm_bindgen_test]
+async fn test_fetch_for_local_development_rewrites_only_its_origin() {
+    let origin = "https://localhost:18580";
+    let transport =
+        FetchTransport::for_local_development(FetchConfig::default(), origin, "http://127.0.0.1:9")
+            .unwrap();
+    for other in [
+        "https://localhost:18581",
+        "https://localhost",
+        "https://LOCALHOST:18580",
+        "http://localhost:18580",
+        "http://127.0.0.1:9",
+        "https://dispatch.invalid",
+    ] {
+        let error = transport.send(request(other)).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::Refused(_)),
+            "{other}: {error:?}"
+        );
+    }
+    for path in [
+        "v1/x/directory",
+        "/v1/x/../y",
+        "/v1/x directory",
+        "/v1/x/feed?after=a b",
+        "/v1/x/directory#part",
+    ] {
+        let mut request = request(origin);
+        request.path_and_query = path.into();
+        let error = transport.send(request).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::InvalidRequest(_)),
+            "{path}: {error:?}"
+        );
+    }
+    // Its own origin, with a path that reads back unchanged, passes the URL checks: the header
+    // check refuses the request.
+    let error = transport
+        .send(with_forbidden_header(origin))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, TransportError::InvalidRequest(_)),
+        "{error:?}"
+    );
+}

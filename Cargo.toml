@@ -5,9 +5,21 @@ resolver = "2"
 # builds compile nothing of it and get none of the test-only features it turns on. A wasm32 build
 # with `--workspace` does unify those features into the graph of paykit-browser, so a wasm32 build
 # of the SDK selects `-p paykit-browser`, as CI and `paykit-browser/rig/check-wasm-deps.sh` do.
+#
+# `paykit-wasm` is the browser engine module, built the same way: empty on every target but
+# wasm32-unknown-unknown, and built with `-p paykit-wasm` (`paykit-wasm/build.sh`).
+#
 # `paykit-peer` is a native-only scripted wallet for local tests: every dependency sits in a
 # non-wasm32 target table, so a wasm32 graph never sees it.
-members = ["paykit-lib", "paykit-sdk", "paykit-ffi", "paykit-browser", "paykit-browser/rig/harness", "paykit-peer"]
+members = [
+  "paykit-lib",
+  "paykit-sdk",
+  "paykit-ffi",
+  "paykit-browser",
+  "paykit-browser/rig/harness",
+  "paykit-wasm",
+  "paykit-peer",
+]
 
 [workspace.package]
 version = "0.2.0-alpha.0"
