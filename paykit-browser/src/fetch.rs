@@ -162,10 +162,29 @@ impl Default for FetchConfig {
 /// and the one SDK path that submits such a batch.
 ///
 /// Error text is fixed: it never quotes a header value, a body or a JavaScript error.
+///
+/// [`FetchTransport::for_local_development`] makes a transport of another kind, for a Dispatch
+/// on the developer's own machine only: it sends every request signed for one fixed
+/// `https://localhost` origin to a plain HTTP listener on loopback, and refuses every other
+/// origin. Its docs say what it skips.
 #[derive(Clone, Debug)]
 pub struct FetchTransport {
     config: FetchConfig,
     allows_localhost: bool,
+    /// Set by [`FetchTransport::for_local_development`] only.
+    local: Option<LocalListener>,
+}
+
+/// Local development only: the one origin a [`FetchTransport::for_local_development`]
+/// transport serves, and the plain HTTP listener on loopback its requests go to instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalListener {
+    /// The origin the requests are signed for, `https://localhost[:<port>]`, as the client
+    /// spells it.
+    origin: String,
+    /// `http://127.0.0.1:<port>` or `http://localhost:<port>`, as the browser's URL parser
+    /// spells it.
+    listener: String,
 }
 
 impl FetchTransport {
@@ -177,6 +196,7 @@ impl FetchTransport {
         Self {
             config,
             allows_localhost: false,
+            local: None,
         }
     }
 
@@ -194,7 +214,55 @@ impl FetchTransport {
         Self {
             config,
             allows_localhost: true,
+            local: None,
         }
+    }
+
+    /// **Local development only.** A transport for a Dispatch running on this machine over
+    /// plain HTTP: every request signed for `origin` is sent to `listener` instead, and a
+    /// request for any other origin is refused with [`TransportError::Refused`] before
+    /// anything is sent.
+    ///
+    /// - `origin` is the Dispatch's origin, the label every request is signed for and every
+    ///   `identity.json` names. It must be `https://localhost` or `https://localhost:<port>`,
+    ///   spelled exactly so, and pass the Dispatch's origin check with its own port allowed.
+    ///   Nothing has to listen on it with TLS: the service never reads the scheme or the
+    ///   `Host` header, so the signatures still cover the https origin.
+    /// - `listener` is where the requests go: exactly `http://127.0.0.1:<port>` or
+    ///   `http://localhost:<port>`, the port without leading zeros, and not 80. It must answer
+    ///   CORS requests from the page's origin, as [`FetchTransport`] describes.
+    ///
+    /// Each request goes to `listener` followed by the signed path and query, which the
+    /// browser's URL parser must read back unchanged, or the request is
+    /// [`TransportError::InvalidRequest`]. Everything else is as for [`FetchTransport::new`]:
+    /// the request's method, headers and body, the timeouts, the body limit and the error
+    /// mapping. [`FetchConfig::extra_ports`] is not used.
+    ///
+    /// The page must not be served over https: a secure page may not call the plain HTTP
+    /// listener (mixed content). `http://localhost` and `http://127.0.0.1` pages are secure
+    /// contexts, so the browser's storage and WebCrypto still work there.
+    ///
+    /// Never use it outside a developer's machine: the connection is not encrypted or
+    /// authenticated, and a listener on loopback is only this machine's. The response
+    /// signatures are still checked by the Dispatch client.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Refused`] when `origin` or `listener` is not of the form above.
+    pub fn for_local_development(
+        config: FetchConfig,
+        origin: &str,
+        listener: &str,
+    ) -> Result<Self, TransportError> {
+        let local = LocalListener {
+            origin: local_origin(origin)?,
+            listener: local_listener(listener)?,
+        };
+        Ok(Self {
+            config,
+            allows_localhost: false,
+            local: Some(local),
+        })
     }
 
     /// One call, raced against its timeout. When the timeout wins, the call's future is
@@ -273,6 +341,9 @@ impl FetchTransport {
                 "the path doesn't start with '/'".into(),
             ));
         }
+        if let Some(local) = &self.local {
+            return local.url(request);
+        }
         let checked = check_url(
             &request.origin,
             &UrlUse::DispatchOrigin {
@@ -346,6 +417,85 @@ impl Transport for FetchTransport {
                 })
         })
     }
+}
+
+impl LocalListener {
+    /// Local development only: the listener's URL for `request`, whose path starts with
+    /// `/`. A request for another origin is refused, and a path or query the browser's URL
+    /// parser would change, or a fragment, is invalid: the request must go out as signed.
+    fn url(&self, request: &Request) -> Result<String, TransportError> {
+        if request.origin != self.origin {
+            return Err(TransportError::Refused(
+                "the local development transport serves one Dispatch origin only".into(),
+            ));
+        }
+        let changed =
+            || TransportError::InvalidRequest("the URL changes the signed path or query".into());
+        if request.path_and_query.contains('#') {
+            return Err(changed());
+        }
+        let url = format!("{}{}", self.listener, request.path_and_query);
+        let parsed = Url::new(&url).map_err(|_| changed())?;
+        if parsed.href() != url {
+            return Err(changed());
+        }
+        Ok(url)
+    }
+}
+
+/// Local development only: `origin` if it is `https://localhost` or
+/// `https://localhost:<port>`, spelled exactly so, and passes the Dispatch's origin check with
+/// its own port allowed.
+fn local_origin(origin: &str) -> Result<String, TransportError> {
+    let refused = || {
+        TransportError::Refused(
+            "a local development origin is https://localhost or https://localhost:<port>".into(),
+        )
+    };
+    let port = match origin.strip_prefix("https://localhost") {
+        Some("") => 443,
+        Some(rest) => rest
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .ok_or_else(refused)?,
+        None => return Err(refused()),
+    };
+    let checked = check_url(
+        origin,
+        &UrlUse::DispatchOrigin {
+            extra_ports: vec![port],
+        },
+    )
+    .map_err(|_| refused())?;
+    if checked.host != "localhost" || checked.port != port {
+        return Err(refused());
+    }
+    Ok(origin.to_owned())
+}
+
+/// Local development only: `listener` if it is exactly `http://127.0.0.1:<port>` or
+/// `http://localhost:<port>`, the port without leading zeros, and the browser's URL parser
+/// reads it as that origin (so not port 80, which it leaves out).
+fn local_listener(listener: &str) -> Result<String, TransportError> {
+    let refused = || {
+        TransportError::Refused(
+            "a local development listener is http://127.0.0.1:<port> or http://localhost:<port>"
+                .into(),
+        )
+    };
+    let rest = listener.strip_prefix("http://").ok_or_else(refused)?;
+    let (host, port) = rest.split_once(':').ok_or_else(refused)?;
+    let port_ok = !port.starts_with('0')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok();
+    if !(host == "127.0.0.1" || host == "localhost") || !port_ok {
+        return Err(refused());
+    }
+    let parsed = Url::new(listener).map_err(|_| refused())?;
+    if parsed.origin() != listener {
+        return Err(refused());
+    }
+    Ok(listener.to_owned())
 }
 
 /// The names under which hosts resolve to the local machine: `localhost`, and `localdomain`
