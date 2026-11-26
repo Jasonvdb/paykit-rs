@@ -1,0 +1,12 @@
+# Binding names for the renamed iOS demo build (build-ios-renamed.sh). The renamed library
+# can sit in one app beside a Paykit v0.1 package, whose Swift module is `Paykit`, whose FFI
+# module is `paykitFFI` and whose library is `libpaykit.a`.
+#
+# The Kotlin section is only here because prepare-bindings.py reads the Kotlin output too.
+[bindings.kotlin]
+package_name = "com.synonym.paykit.v2"
+cdylib_name = "paykit_v2"
+
+[bindings.swift]
+module_name = "PaykitV2"
+ffi_module_name = "PaykitV2FFI"
