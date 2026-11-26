@@ -1,0 +1,32 @@
+[package]
+name = "paykit-peer"
+description = "A scripted Paykit v0.2 wallet for local tests: one identity, an in-process signer, a local Dispatch, a fake Homeserver and a regtest on-chain rail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+# Local test tool only. On wasm32 the binary is an empty `main`, and every dependency sits in the
+# native target table below, so no wasm32 graph sees any of them.
+[[bin]]
+name = "paykit-peer"
+path = "src/main.rs"
+doctest = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+paykit-lib = { workspace = true, features = ["signer"] }
+paykit-sdk = { path = "../paykit-sdk" }
+# The client's native HTTP transport (`http`), which the peer sends to the local Dispatch with.
+pubky-dispatch-client = { workspace = true, features = ["http"] }
+pubky-dispatch-core.workspace = true
+pubky-dispatch-signer.workspace = true
+# Plain HTTP to the fake Homeserver and to bitcoind's JSON-RPC, both on loopback. No TLS.
+reqwest = { version = "0.12.28", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.54.1", features = ["rt", "time", "macros", "sync", "io-std", "io-util"] }

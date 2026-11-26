@@ -8,6 +8,9 @@ resolver = "2"
 #
 # `paykit-wasm` is the browser engine module, built the same way: empty on every target but
 # wasm32-unknown-unknown, and built with `-p paykit-wasm` (`paykit-wasm/build.sh`).
+#
+# `paykit-peer` is a native-only scripted wallet for local tests: every dependency sits in a
+# non-wasm32 target table, so a wasm32 graph never sees it.
 members = [
   "paykit-lib",
   "paykit-sdk",
@@ -15,6 +18,7 @@ members = [
   "paykit-browser",
   "paykit-browser/rig/harness",
   "paykit-wasm",
+  "paykit-peer",
 ]
 
 [workspace.package]
