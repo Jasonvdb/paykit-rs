@@ -34,7 +34,7 @@ use crate::bitcoind::Bitcoind;
 use crate::cli::{Command, Line};
 use crate::events::{emit, variant};
 use crate::homeserver::{FakeHomeserver, OwnHomeserver};
-use crate::rail::{address_payload, amount_sats, btc_amount, RegtestRail, P2WPKH};
+use crate::rail::{address_payload, amount_sats, btc_amount, RegtestRail, P2TR, P2WPKH};
 use crate::state::{hex, unhex, PeerConfig, StateDir};
 use crate::store::FileStore;
 use crate::transport::LoopbackListener;
@@ -107,6 +107,43 @@ pub fn parse_id(text: &str) -> anyhow::Result<[u8; 32]> {
         .or_else(|| text.strip_prefix("pk:"))
         .unwrap_or(text);
     pubky_key(bare).map_err(|_| anyhow!("{text:?} is not a Pubky ID"))
+}
+
+/// Splits a stdin command line into words at whitespace. Text in double or single quotes stays
+/// one word, so a reference can hold spaces: `request <id> 15000 --reference "Concert tickets"`.
+/// `None` for an unbalanced quote.
+fn split_line(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for character in line.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => word.push(character),
+            None if character == '"' || character == '\'' => {
+                quote = Some(character);
+                in_word = true;
+            }
+            None if character.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(character);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// A random payment reference.
@@ -391,8 +428,9 @@ impl Peer {
                 id,
                 sats,
                 any,
+                taproot,
                 reference,
-            } => Box::pin(self.request(&id, sats, any, reference)).await,
+            } => Box::pin(self.request(&id, sats, any, taproot, reference)).await,
             Command::PublishList { id } => Box::pin(self.publish_list(&id)).await,
             Command::Run { .. } => bail!("run is not a command for a running peer"),
         }
@@ -404,6 +442,7 @@ impl Peer {
         id: &str,
         sats: u64,
         any: bool,
+        taproot: bool,
         reference: Option<String>,
     ) -> anyhow::Result<()> {
         let payer = parse_id(id)?;
@@ -411,11 +450,18 @@ impl Peer {
             Some(text) => PaymentReference::new(&text)?,
             None => random_reference()?,
         };
+        let endpoint_id = if taproot { P2TR } else { P2WPKH };
         let (destination, address) = if any {
             (RequestDestination::Any, None)
         } else {
-            let address = self.rail.node().new_address(self.rail.wallet()).await?;
-            let endpoints = [(p2wpkh(), address_payload(&address)?)]
+            let node = self.rail.node();
+            let address = if taproot {
+                node.new_taproot_address(self.rail.wallet()).await?
+            } else {
+                node.new_address(self.rail.wallet()).await?
+            };
+            let identifier = PaymentEndpointIdentifier::new(endpoint_id)?;
+            let endpoints = [(identifier, address_payload(&address)?)]
                 .into_iter()
                 .collect();
             (RequestDestination::Endpoints(endpoints), Some(address))
@@ -434,7 +480,7 @@ impl Peer {
                 "sats": sats,
                 "reference": reference.as_str(),
                 "destination": if any { "any" } else { "endpoints" },
-                "endpoint_id": if any { Value::Null } else { Value::from(P2WPKH) },
+                "endpoint_id": if any { Value::Null } else { Value::from(endpoint_id) },
                 "address": address,
                 "delivery": variant(&sent.delivery),
             }),
@@ -785,7 +831,14 @@ impl Peer {
                 return Ok(());
             }
             let Some(line) = line else { continue };
-            let words: Vec<&str> = line.split_whitespace().collect();
+            let Some(words) = split_line(&line) else {
+                emit(
+                    "command_failed",
+                    json!({ "command": "", "line": line, "error": "unbalanced quote" }),
+                );
+                continue;
+            };
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
             match words.first() {
                 None => continue,
                 Some(&"quit" | &"exit") => {
@@ -884,4 +937,35 @@ async fn approve_app(signer: &mut Signer, identity: [u8; 32]) -> anyhow::Result<
         request,
         approval: approval.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_line;
+
+    #[test]
+    fn test_split_line_keeps_quoted_words() {
+        let words = split_line(r#"request pk:abc 15000 --reference "Concert tickets" --taproot"#);
+        assert_eq!(
+            words.unwrap(),
+            [
+                "request",
+                "pk:abc",
+                "15000",
+                "--reference",
+                "Concert tickets",
+                "--taproot"
+            ]
+        );
+        assert_eq!(split_line("  id  ").unwrap(), ["id"]);
+        assert_eq!(
+            split_line("request x 1 --reference ''").unwrap(),
+            ["request", "x", "1", "--reference", ""]
+        );
+    }
+
+    #[test]
+    fn test_split_line_refuses_an_unbalanced_quote() {
+        assert!(split_line(r#"request x 1 --reference "Concert"#).is_none());
+    }
 }

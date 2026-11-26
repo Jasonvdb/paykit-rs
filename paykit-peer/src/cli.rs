@@ -66,8 +66,12 @@ pub enum Command {
     Request {
         id: String,
         sats: u64,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "taproot")]
         any: bool,
+        /// Ask to be paid to a new Taproot (P2TR, `bcrt1p...`) address, endpoint
+        /// `btc-regtest-p2tr`, instead of a P2WPKH one.
+        #[arg(long)]
+        taproot: bool,
         /// The payment reference; random by default.
         #[arg(long)]
         reference: Option<String>,
@@ -75,7 +79,8 @@ pub enum Command {
     /// Set this app's Private Payment List to a new address and publish it to `id`.
     PublishList { id: String },
     /// Run: receive, print events, and take commands on stdin (`allow <id>`, `request <id>
-    /// <sats> [--any]`, `publish-list <id>`, `fund <sats>`, `id`, `quit`).
+    /// <sats> [--any|--taproot] [--reference <text>]`, `publish-list <id>`, `fund <sats>`, `id`,
+    /// `quit`).
     Run {
         /// Pay every open one-time request that arrives.
         #[arg(long)]

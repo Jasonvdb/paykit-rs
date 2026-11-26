@@ -130,8 +130,21 @@ impl Bitcoind {
 
     /// A new bech32 (P2WPKH) receive address of `wallet`.
     pub async fn new_address(&self, wallet: &str) -> Result<String, RpcError> {
+        self.new_address_of_type(wallet, "bech32").await
+    }
+
+    /// A new bech32m (P2TR, Taproot) receive address of `wallet`.
+    pub async fn new_taproot_address(&self, wallet: &str) -> Result<String, RpcError> {
+        self.new_address_of_type(wallet, "bech32m").await
+    }
+
+    async fn new_address_of_type(
+        &self,
+        wallet: &str,
+        address_type: &str,
+    ) -> Result<String, RpcError> {
         let address = self
-            .call(Some(wallet), "getnewaddress", json!(["", "bech32"]))
+            .call(Some(wallet), "getnewaddress", json!(["", address_type]))
             .await?;
         address
             .as_str()

@@ -27,7 +27,7 @@ cargo build --locked -p paykit-peer
 
 | Item | Value |
 |---|---|
-| Receive identifier | `btc-regtest-p2wpkh`, a new `getnewaddress "" bech32` address of the peer's wallet |
+| Receive identifier | `btc-regtest-p2wpkh`, a new `getnewaddress "" bech32` address of the peer's wallet; with `request --taproot`, `btc-regtest-p2tr`, a new `getnewaddress "" bech32m` address |
 | Identifiers it pays | `btc-regtest-p2wpkh`, `btc-regtest-p2tr` |
 | Payload | `{"value":"<address>"}` |
 | Amount | asset `btc`, decimal BTC with 8 fraction digits |
@@ -51,7 +51,7 @@ paykit-peer [--state <dir>] [--dispatch-url http://127.0.0.1:18580] [--origin ht
 | `id` | Print the Pubky ID (z-base-32, no prefix) alone on one line, from the state directory |
 | `fund <sats>` | Fund the peer's bitcoind wallet up to at least `<sats>` from `--funder-wallet` (mining 101 blocks to the funder when it is short), then mine one block |
 | `allow <id>` | Allow identity `<id>` to start a conversation (admission, `allow_connect`) |
-| `request <id> <sats> [--any] [--reference <text>]` | Request `<sats>` from `<id>`: to a new P2WPKH address, or with `--any` to any of this identity's Private Payment Lists (`RequestDestination::Any`) |
+| `request <id> <sats> [--any\|--taproot] [--reference <text>]` | Request `<sats>` from `<id>`: to a new P2WPKH address (`btc-regtest-p2wpkh`), with `--taproot` to a new P2TR address (`getnewaddress "" bech32m`, `btc-regtest-p2tr`), or with `--any` to any of this identity's Private Payment Lists (`RequestDestination::Any`) |
 | `publish-list <id>` | Set this app's Private Payment List to a new P2WPKH address and publish it to `<id>` |
 | `run [--auto-pay] [--auto-confirm] [--fund <sats>] [--poll-ms 1000]` | Receive in a loop, print events, and take commands on stdin |
 
@@ -61,8 +61,9 @@ Every command except `run` needs `--state`. Each opens the state directory, does
 exits. A directory is locked while a process uses it: while a peer is running, send it commands
 on its stdin instead.
 
-`run` reads one command per line on stdin: `allow <id>`, `request <id> <sats> [--any]`,
-`publish-list <id>`, `fund <sats>`, `id`, and `quit`. It stops at `quit` or when stdin closes.
+`run` reads one command per line on stdin: `allow <id>`, `request <id> <sats> [--any|--taproot]
+[--reference <text>]`, `publish-list <id>`, `fund <sats>`, `id`, and `quit`. Words are split at
+whitespace; text in double or single quotes stays one word (`--reference "Concert tickets"`). It stops at `quit` or when stdin closes.
 Each round it reads the inbox, sends what is queued, then:
 
 - with `--auto-pay`, pays every open one-time request it holds (one try per request; a
