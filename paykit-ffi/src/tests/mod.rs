@@ -9,6 +9,7 @@ mod executor;
 mod extensions;
 mod host_calls;
 mod lists;
+mod live_dispatch;
 mod method;
 mod opaque;
 mod payee;

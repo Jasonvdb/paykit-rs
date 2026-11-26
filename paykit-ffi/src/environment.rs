@@ -132,18 +132,76 @@ impl WalletHost {
         endpoints: Vec<EndpointSupport>,
         config: Option<WalletConfig>,
     ) -> Result<Arc<Self>, WalletError> {
+        let transport = HttpTransport::new(HttpConfig::default())
+            .map_err(|_| WalletError::invalid("HTTPS transport configuration"))?;
+        Self::with_transport(
+            store,
+            homeserver,
+            method,
+            declaration,
+            endpoints,
+            config,
+            Arc::new(transport),
+        )
+    }
+
+    /// LOCAL DEVELOPMENT ONLY: connects to a Pubky Dispatch on this machine over plain HTTP.
+    /// Never use it in a release build or with a Dispatch on another machine.
+    ///
+    /// Works as [`WalletHost::new`], except that every Dispatch request goes to one local
+    /// service. The requests are still signed for `dispatch_origin`, the https origin the
+    /// service is configured with and its `identity.json` records name, which must be
+    /// `https://localhost[:<port>]`. They are sent instead to `dispatch_listener`, the
+    /// service's plain HTTP listener, which must be `http://127.0.0.1:<port>` or
+    /// `http://localhost:<port>`. A request for any other origin, such as a counterparty on
+    /// another Dispatch, is refused before anything is sent. Nothing checks addresses or
+    /// TLS on this path, which is why both values are limited to this machine. An iOS
+    /// simulator shares the machine's loopback; a physical phone does not.
+    #[uniffi::constructor(default(config = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_local_development(
+        store: Arc<dyn WalletStore>,
+        homeserver: Arc<dyn WalletHomeserver>,
+        method: Arc<dyn PaymentMethod>,
+        declaration: MethodDeclaration,
+        endpoints: Vec<EndpointSupport>,
+        dispatch_origin: String,
+        dispatch_listener: String,
+        config: Option<WalletConfig>,
+    ) -> Result<Arc<Self>, WalletError> {
+        let transport = crate::local_dispatch::transport(&dispatch_origin, &dispatch_listener)?;
+        Self::with_transport(
+            store,
+            homeserver,
+            method,
+            declaration,
+            endpoints,
+            config,
+            transport,
+        )
+    }
+}
+
+impl WalletHost {
+    fn with_transport(
+        store: Arc<dyn WalletStore>,
+        homeserver: Arc<dyn WalletHomeserver>,
+        method: Arc<dyn PaymentMethod>,
+        declaration: MethodDeclaration,
+        endpoints: Vec<EndpointSupport>,
+        config: Option<WalletConfig>,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Arc<Self>, WalletError> {
         let endpoints = supported_endpoints(endpoints)?;
         let config = config
             .map(PaykitConfig::try_from)
             .transpose()?
             .unwrap_or_default();
         let home = Arc::new(Home(homeserver));
-        let transport = HttpTransport::new(HttpConfig::default())
-            .map_err(|_| WalletError::invalid("HTTPS transport configuration"))?;
         Ok(Arc::new(Self {
             config,
             clock: Arc::new(SystemClock),
-            transport: Arc::new(transport),
+            transport,
             home: home.clone(),
             writer: home,
             store,
