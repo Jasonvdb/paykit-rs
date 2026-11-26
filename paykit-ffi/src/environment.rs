@@ -66,7 +66,7 @@ struct Home(Arc<dyn WalletHomeserver>);
 
 /// Wait for a host Homeserver call at most [`HOST_CALL_LIMIT`]. Past it the call counts as
 /// timed out, which leaves a write's outcome unknown, as for any transport timeout.
-async fn bounded<T>(
+pub(crate) async fn bounded<T>(
     call: impl std::future::Future<Output = Result<T, HomeserverError>>,
 ) -> Result<T, TransportError> {
     Ok(tokio::time::timeout(HOST_CALL_LIMIT, call)
