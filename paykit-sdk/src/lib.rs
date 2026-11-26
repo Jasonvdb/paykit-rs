@@ -283,6 +283,9 @@ mod tests {
                     }),
                     manual_only: false,
                     periods: Vec::new(),
+                    destination: RequestDestination::Endpoints(
+                        [(id(), payload())].into_iter().collect(),
+                    ),
                 }
             ),
             format!(

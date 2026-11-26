@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use paykit_sdk::rail::FakeRail;
 use paykit_sdk::{
-    AppScopes, MessageDelivery, PayOptions, PayeeStatus, Paykit, PaykitConfig, RequestStatus,
+    AppScopes, MessageDelivery, PayOptions, PayeeStatus, Paykit, PaykitConfig, RequestDestination,
+    RequestStatus,
 };
 use pubky_dispatch_client::app::AppError;
 use pubky_dispatch_client::store::MemoryStore;
@@ -15,7 +16,8 @@ use pubky_dispatch_core::http::ErrorCode;
 use pubky_dispatch_harness::World;
 
 use super::{
-    btc, endpoint, invoice, on_both_backends, paid_and_receipted, Expected, Owner, TestResult,
+    btc, endpoint, invoice, on_both_backends, paid_and_receipted, payload, Expected, Owner,
+    TestResult,
 };
 
 #[tokio::test]
@@ -106,6 +108,15 @@ async fn admits_the_seller_and_its_waiting_request_is_paid(world: &World) -> Tes
     );
     let requests = Box::pin(wallet.requests()).await?;
     assert_eq!(requests.len(), 1, "{requests:?}");
+    // The payer's view names the destination the seller signed: its one endpoint.
+    assert_eq!(
+        requests[0].destination,
+        RequestDestination::Endpoints(
+            [(endpoint("btc-lightning-bolt11")?, payload("lnbc-first")?)]
+                .into_iter()
+                .collect()
+        )
+    );
     assert_eq!(
         Box::pin(wallet.request(&request)).await?.status,
         RequestStatus::Open

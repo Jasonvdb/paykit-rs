@@ -76,6 +76,26 @@ impl EngineError {
     pub fn paykit(step: &str, error: &dyn fmt::Display) -> Self {
         Self::new("paykit", format!("{step}: {error}"))
     }
+
+    /// `invalid_input`: an argument of a call other than `start` is malformed.
+    pub fn invalid_input(text: impl Into<String>) -> Self {
+        Self::new("invalid_input", text)
+    }
+
+    /// `homeserver`: a host Homeserver call failed during `resetIdentity`.
+    pub fn homeserver(step: &str, error: &dyn fmt::Display) -> Self {
+        Self::new("homeserver", format!("{step}: {error}"))
+    }
+
+    /// The code, as JavaScript sees it before the colon.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The text after the code.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 impl fmt::Display for EngineError {

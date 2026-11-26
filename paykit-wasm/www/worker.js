@@ -1,13 +1,16 @@
-// Smoke test worker: one engine in a dedicated module worker, driven by messages from the page.
+// Harness worker: one engine in a dedicated module worker, driven by messages from the page.
 //
-//   page -> worker: {id, op: "start" | "identity" | "stop" | "version", args}
-//   worker -> page: {id, ok: true, value} | {id, ok: false, error}
+//   page -> worker: {id, op, args}     op is an export of the engine module; args its arguments
+//   worker -> page: {kind: "result", id, ok: true, value} | {kind: "result", id, ok: false, error}
+//                   {kind: "event", event}                 each engine event, in order
 //
-// For "start", args are the plain start options plus `homeserverUrl`, the base URL of a
-// Homeserver with the fake Homeserver's API (GET/PUT/DELETE /{identityZ32}{path}). The worker
-// builds the Homeserver callbacks on fetch against it, for the engine's own identity.
+// For "start" and "resetIdentity", args[0] may carry `homeserverUrl`, the base URL of a
+// Homeserver with the fake Homeserver's API (GET/PUT/DELETE /{identityZ32}{path}), and
+// `ownIdentity`, the engine's Pubky ID. The worker then builds the Homeserver callbacks on
+// fetch against it, for that identity, and drops both keys from the options. "start" also
+// gets an `onEvent` callback that forwards each event to the page.
 
-import init, { identity, start, stop, version } from "./pkg/paykit_wasm.js";
+import init, * as engine from "./pkg/paykit_wasm.js";
 
 const ready = init({ module_or_path: new URL("./pkg/paykit_wasm_bg.wasm", import.meta.url) });
 
@@ -21,43 +24,46 @@ function fetchHomeserver(base, own) {
       return new Uint8Array(await answer.arrayBuffer());
     },
     async put(path, bytes) {
-      const answer = await fetch(url(own(), path), { method: "PUT", body: bytes });
+      const answer = await fetch(url(own, path), { method: "PUT", body: bytes });
       if (!answer.ok) throw new Error(`put answered ${answer.status}`);
     },
     async delete(path) {
-      const answer = await fetch(url(own(), path), { method: "DELETE" });
-      if (!answer.ok) throw new Error(`delete answered ${answer.status}`);
+      const answer = await fetch(url(own, path), { method: "DELETE" });
+      if (!answer.ok && answer.status !== 404) throw new Error(`delete answered ${answer.status}`);
     },
   };
 }
 
-async function run(op, args) {
-  await ready;
-  switch (op) {
-    case "version":
-      return version();
-    case "start": {
-      const { homeserverUrl, ownIdentity, ...options } = args;
-      // The engine's identity is known only once it starts, and the signer writes during the
-      // start: the caller passes it, as a host that derives it from the same key would.
-      options.homeserver = fetchHomeserver(homeserverUrl, () => ownIdentity);
-      return await start(options);
-    }
-    case "identity":
-      return identity();
-    case "stop":
-      return await stop();
-    default:
-      throw new Error(`unknown op ${op}`);
-  }
+// The options with the harness's keys replaced by the callbacks they describe.
+function withHomeserver(options) {
+  if (!options || options.homeserverUrl === undefined) return options;
+  const { homeserverUrl, ownIdentity, ...rest } = options;
+  // The engine's identity is known only once it starts, and the signer writes during the
+  // start: the caller passes it, as a host that derives it from the same key would.
+  return { ...rest, homeserver: fetchHomeserver(homeserverUrl, ownIdentity) };
 }
 
-self.onmessage = async (event) => {
-  const { id, op, args } = event.data;
+async function run(op, args) {
+  await ready;
+  const call = engine[op];
+  if (typeof call !== "function" || op === "default" || op.startsWith("init")) {
+    throw new Error(`unknown op ${op}`);
+  }
+  if (op === "start") {
+    const options = withHomeserver(args[0]);
+    options.onEvent = (event) => self.postMessage({ kind: "event", event });
+    return await call(options);
+  }
+  if (op === "resetIdentity") return await call(withHomeserver(args[0]));
+  return await call(...args);
+}
+
+self.onmessage = async (message) => {
+  const { id, op, args } = message.data;
   try {
-    const value = await run(op, args ?? {});
-    self.postMessage({ id, ok: true, value: value ?? null });
+    const value = await run(op, args ?? []);
+    self.postMessage({ kind: "result", id, ok: true, value: value ?? null });
   } catch (error) {
-    self.postMessage({ id, ok: false, error: String(error?.message ?? error) });
+    self.postMessage({ kind: "result", id, ok: false, error: String(error?.message ?? error) });
   }
 };

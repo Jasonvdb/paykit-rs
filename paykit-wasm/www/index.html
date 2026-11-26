@@ -2,21 +2,28 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>paykit-wasm smoke</title>
+    <title>paykit-wasm harness</title>
+    <link rel="icon" href="data:," />
     <script type="module">
-      // Each worker runs one engine. `smoke.mjs` drives them through these two functions.
+      // Each worker runs one engine. `harness.mjs` drives them through these functions, and
+      // receives each engine event through `window.__engineEvent(name, event)`, a binding the
+      // harness exposes before the page loads.
       const workers = new Map();
       let next = 0;
 
       window.openWorker = (name) => {
         const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
         const pending = new Map();
-        worker.onmessage = (event) => {
-          const { id, ok, value, error } = event.data;
-          const call = pending.get(id);
-          pending.delete(id);
-          if (ok) call.resolve(value);
-          else call.reject(new Error(error));
+        worker.onmessage = (message) => {
+          const data = message.data;
+          if (data.kind === "event") {
+            window.__engineEvent?.(name, data.event);
+            return;
+          }
+          const call = pending.get(data.id);
+          pending.delete(data.id);
+          if (data.ok) call?.resolve(data.value);
+          else call?.reject(new Error(data.error));
         };
         worker.onerror = (event) => {
           for (const call of pending.values()) call.reject(new Error(`worker error: ${event.message}`));
@@ -34,13 +41,17 @@
           entry.worker.postMessage({ id, op, args });
         });
 
+      // Terminates the worker at once, as a crash would: no `stop`, calls in flight rejected.
       window.closeWorker = (name) => {
-        workers.get(name)?.worker.terminate();
+        const entry = workers.get(name);
+        if (!entry) return;
+        entry.worker.terminate();
+        for (const call of entry.pending.values()) call.reject(new Error("worker terminated"));
         workers.delete(name);
       };
     </script>
   </head>
   <body>
-    paykit-wasm smoke
+    paykit-wasm harness
   </body>
 </html>

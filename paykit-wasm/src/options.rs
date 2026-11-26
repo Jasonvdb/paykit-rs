@@ -48,6 +48,11 @@ pub struct StartOptions {
     pub homeserver: HomeserverCallbacks,
     /// The host's payment method callbacks.
     pub rail: RailCallbacks,
+    /// The host's `onEvent(event)` callback, if any (`events.rs`).
+    pub on_event: Option<Function>,
+    /// Whether the engine runs its own feed loop from `start` until `stop`: `true` unless
+    /// the host turns it off to drive `receive` itself.
+    pub auto_receive: bool,
 }
 
 /// The host's Homeserver: `get(identityZ32, path)`, `put(path, bytes)` and `delete(path)`.
@@ -84,6 +89,11 @@ struct PlainOptions {
     store_prefix: Option<String>,
     #[serde(default)]
     client_id: Option<String>,
+    #[serde(default)]
+    auto_receive: Option<bool>,
+    /// `onEvent` is a function, which `JSON.stringify` drops; a `null` is accepted too.
+    #[serde(default, rename = "onEvent")]
+    _on_event: Option<serde::de::IgnoredAny>,
     /// The callbacks' object: `{}` once its functions are dropped. Required here, so a host
     /// that forgot it hears so; its callbacks are read from the object itself.
     #[serde(rename = "homeserver")]
@@ -162,6 +172,7 @@ impl StartOptions {
             payment: optional_function(&rail_object, "rail", "payment")?,
             verify: optional_function(&rail_object, "rail", "verify")?,
         };
+        let on_event = optional_function(value, "options", "onEvent")?;
 
         Ok(Self {
             secret,
@@ -172,17 +183,96 @@ impl StartOptions {
             endpoints,
             homeserver,
             rail,
+            on_event,
+            auto_receive: plain.auto_receive.unwrap_or(true),
         })
     }
 
     /// The name of the app's store.
     pub fn app_store_name(&self) -> String {
-        format!("{}-app", self.store_prefix)
+        app_store_name(&self.store_prefix)
     }
 
     /// The name of the signer's store.
     pub fn signer_store_name(&self) -> String {
-        format!("{}-signer", self.store_prefix)
+        signer_store_name(&self.store_prefix)
+    }
+}
+
+/// The name of the app's store of `prefix`.
+pub fn app_store_name(prefix: &str) -> String {
+    format!("{prefix}-app")
+}
+
+/// The name of the signer's store of `prefix`.
+pub fn signer_store_name(prefix: &str) -> String {
+    format!("{prefix}-signer")
+}
+
+/// The options of `resetIdentity` when no engine runs in the worker.
+pub struct ResetOptions {
+    /// The prefix of the two stores to destroy.
+    pub store_prefix: String,
+    /// The host's Homeserver, to delete the signer's files with; `None` to leave them.
+    pub homeserver: Option<HomeserverCallbacks>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlainReset {
+    #[serde(default)]
+    store_prefix: Option<String>,
+    #[serde(default, rename = "homeserver")]
+    _homeserver: Option<serde::de::IgnoredAny>,
+}
+
+impl ResetOptions {
+    /// Reads the options from `value`: an object, or `undefined` for the defaults.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] `bad_options` for a malformed option.
+    pub fn read(value: &JsValue) -> Result<Self, EngineError> {
+        if value.is_undefined() || value.is_null() {
+            return Ok(Self {
+                store_prefix: DEFAULT_STORE_PREFIX.to_owned(),
+                homeserver: None,
+            });
+        }
+        if !value.is_object() {
+            return Err(EngineError::bad_options("the options are not an object"));
+        }
+        let json: String = JSON::stringify(value)
+            .ok()
+            .and_then(|text| text.as_string())
+            .ok_or_else(|| EngineError::bad_options("the options do not convert to JSON"))?;
+        let plain = serde_json::from_str::<PlainReset>(&json).map_err(|error| {
+            EngineError::bad_options(format!(
+                "the options do not read (line {}, column {})",
+                error.line(),
+                error.column()
+            ))
+        })?;
+        let store_prefix = plain
+            .store_prefix
+            .unwrap_or_else(|| DEFAULT_STORE_PREFIX.to_owned());
+        check_store_prefix(&store_prefix)?;
+        let homeserver_value = Reflect::get(value, &JsValue::from_str("homeserver"))
+            .map_err(|_| EngineError::bad_options("homeserver cannot be read"))?;
+        let homeserver = if homeserver_value.is_undefined() || homeserver_value.is_null() {
+            None
+        } else {
+            let object = property(value, "homeserver")?;
+            Some(HomeserverCallbacks {
+                get: function(&object, "homeserver", "get")?,
+                put: function(&object, "homeserver", "put")?,
+                delete: function(&object, "homeserver", "delete")?,
+            })
+        };
+        Ok(Self {
+            store_prefix,
+            homeserver,
+        })
     }
 }
 
