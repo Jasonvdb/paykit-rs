@@ -58,6 +58,8 @@ example. In short:
 | `allowConnect(identity)` | `Promise<void>`: lets that identity start a conversation (a payer allows each payee it expects requests from) |
 | `admits(identity)` | `Promise<boolean>`: whether it may, from this app's copy of the lists |
 | `contacts()` | `Promise<{allowed: Admission[], denied: string[]}>`, read from the Dispatch |
+| `probeAdmission(identity)` | `Promise<string>`: sends a `resend_request` that selects nothing; its message ID's delivery tells whether that identity admits this one |
+| `messageDelivery(msgId)` | `Promise<string \| null>`: tries the outbox, then where that message stands (`waitingForAdmission`, `accepted`, ...) |
 | `requests()` | `Promise<OneTimeRequest[]>`: the requests held as payer, each with its `destination` |
 | `payeeActivity()` | `Promise<PayeeRequest[]>`: requests sent and payments received as payee |
 | `payments()` | `Promise<PaymentEntry[]>`: the payer's payments, each with its `stage` and, once it came, the payee's `receipt` |
