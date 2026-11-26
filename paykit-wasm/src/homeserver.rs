@@ -44,6 +44,11 @@ impl JsHomeserver {
         Self { own, callbacks }
     }
 
+    /// The host's callbacks.
+    pub fn callbacks(&self) -> &HomeserverCallbacks {
+        &self.callbacks
+    }
+
     fn read(
         &self,
         identity: [u8; 32],
